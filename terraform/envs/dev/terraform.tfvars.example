@@ -1,0 +1,18 @@
+# Copiar como `terraform.tfvars` y dejar/editar lo necesario.
+# Los defaults del archivo variables.tf cubren un escenario válido,
+# así que para arrancar alcanza con tener este archivo creado y vacío.
+
+region             = "us-east-1"
+cluster_name       = "belo-challenge-dev"
+kubernetes_version = "1.30"
+
+# Si querés restringir el acceso a la API del cluster, dejar tu IP /32 acá.
+# Ejemplo: ["190.x.x.x/32"]
+# Por default queda abierta a internet, lo cual está OK para una demo.
+# endpoint_public_access_cidrs = ["0.0.0.0/0"]
+
+# Si querés conectarte a los nodos por SSH además del SSM Session Manager.
+# El key_pair lo creás aparte en EC2 → Key Pairs.
+# ssh_key_name = "tu-key"
+
+dockerhub_user = "valentinobruno"

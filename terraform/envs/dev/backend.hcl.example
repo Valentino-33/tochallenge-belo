@@ -1,0 +1,9 @@
+# Este archivo NO se commitea con valores reales.
+# Lo carga `make tf-init` con -backend-config=backend.hcl
+# Copiar como backend.hcl y editar.
+
+bucket         = "belo-challenge-tfstate-PEGAR-ALGO-UNICO"
+key            = "envs/dev/terraform.tfstate"
+region         = "us-east-1"
+dynamodb_table = "belo-challenge-tflock"
+encrypt        = true

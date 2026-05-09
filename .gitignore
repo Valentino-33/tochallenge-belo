@@ -1,0 +1,44 @@
+# Terraform
+**/.terraform/
+**/.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfplan
+tfplan
+crash.log
+crash.*.log
+
+# Variables y backends — los example sí se versionan, los reales NO
+**/terraform.tfvars
+**/*.auto.tfvars
+**/backend.hcl
+!**/terraform.tfvars.example
+!**/backend.hcl.example
+
+# Override files
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Policy descargada por `make alb-policy` — la baja cada quien al hacer init
+terraform/modules/alb-controller-irsa/iam_policy.json
+
+# Editor
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Kube
+kubeconfig
+*.kubeconfig
+
+# Secrets
+*.pem
+*.key
+*-credentials*
+
+# Local
+.env
+.env.local

@@ -1,0 +1,7 @@
+# Pegar este archivo como `terraform.tfvars` (sin ".example") y completar.
+# Importante: el bucket S3 tiene que tener un nombre globalmente único en TODO AWS.
+# Recomendado: incluir el account id o tu nombre.
+
+region            = "us-east-1"
+state_bucket_name = "belo-challenge-tfstate-PEGAR-ALGO-UNICO"
+lock_table_name   = "belo-challenge-tflock"
