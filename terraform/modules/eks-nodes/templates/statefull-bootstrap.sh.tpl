@@ -112,7 +112,5 @@ ln -sfn "$MOUNT_POINT/prometheus"    /var/lib/prometheus
 ln -sfn "$MOUNT_POINT/grafana"       /var/lib/grafana
 
 echo "[bootstrap] EBS listo en $MOUNT_POINT"
-
-# 5. Bootstrap EKS normal — esto registra el nodo contra el control plane.
-/etc/eks/bootstrap.sh "$CLUSTER_NAME" \
-  --kubelet-extra-args '--node-labels=role=statefulls --register-with-taints=workload=statefulls:NoSchedule'
+# El registro del nodo contra el control plane lo gestiona EKS vía nodeadm (AL2023).
+# Labels y taints se definen en el aws_eks_node_group resource, no acá.

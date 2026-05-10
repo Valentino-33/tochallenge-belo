@@ -4,7 +4,7 @@
 
 region             = "us-east-1"
 cluster_name       = "belo-challenge-dev"
-kubernetes_version = "1.30"
+kubernetes_version = "1.33"
 
 # Si querés restringir el acceso a la API del cluster, dejar tu IP /32 acá.
 # Ejemplo: ["190.x.x.x/32"]

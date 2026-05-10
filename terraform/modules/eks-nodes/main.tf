@@ -1,5 +1,5 @@
 data "aws_ssm_parameter" "eks_ami_id" {
-  name = "/aws/service/eks/optimized-ami/${var.cluster_version}/amazon-linux-2/recommended/image_id"
+  name = "/aws/service/eks/optimized-ami/${var.cluster_version}/amazon-linux-2023/x86_64/standard/recommended/image_id"
 }
 
 # ──────────────── Launch template del nodo statefull ────────────────
@@ -104,6 +104,7 @@ resource "aws_eks_node_group" "stateless" {
   subnet_ids      = var.stateless_subnet_ids
 
   instance_types = var.stateless_instance_types
+  ami_type       = "AL2023_x86_64_STANDARD"
   capacity_type  = "ON_DEMAND"   # cambiar a SPOT más adelante si se desea bajar costo
 
   scaling_config {
