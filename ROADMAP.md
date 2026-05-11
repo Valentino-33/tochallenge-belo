@@ -17,6 +17,36 @@ funciona y entendés qué quedó desplegado), y después automatizado vía el
 
 ---
 
+## Convención de ambientes y comandos
+
+Todos los targets del `Makefile` aceptan `ENV=<ambiente>` para apuntar al
+directorio correcto. Los ambientes disponibles son:
+
+| ENV | Propósito | State key en S3 |
+|---|---|---|
+| `dev` | Desarrollo activo, ciclos de apply/destroy frecuentes | `envs/dev/terraform.tfstate` |
+| `testing` | CI de features, smoke tests de extremo a extremo | `envs/testing/terraform.tfstate` |
+| `lab` | Investigación de nuevas features de infra | `envs/lab/terraform.tfstate` |
+| `staging` | Validación pre-producción, config idéntica a prod | `envs/staging/terraform.tfstate` |
+| `production` | Datos reales — apply con change management | `envs/production/terraform.tfstate` |
+
+```bash
+# Ejemplos:
+make tf-plan ENV=dev        # plan para dev
+make tf-apply ENV=staging   # apply para staging
+make addons ENV=dev         # instalar addons en dev
+```
+
+> Si no pasás `ENV`, el default es `dev`. Todos los ejemplos del ROADMAP usan
+> `ENV=dev` explícitamente para que sea claro — en la práctica podés omitirlo
+> cuando estás en dev.
+
+> **Después de un destroy:** siempre correr `make tf-reinit ENV=<env>` antes
+> del próximo `make tf-plan`. El destroy invalida el `tfplan` binario y puede
+> dejar el caché local de providers en un estado inconsistente.
+
+---
+
 ## Prerrequisitos generales
 
 - [ ] Cuenta de AWS con permisos de Administrator (o al menos los de IAM, EC2,
@@ -34,16 +64,16 @@ funciona y entendés qué quedó desplegado), y después automatizado vía el
 - [ ] Dominio (opcional para esta etapa). Si no tenés, dejá los hosts apuntando
       al DNS público del ALB hasta que se integre Route53/Cloudflare.
 
-> Si vas a hacer **solo la versión local con k3d**, saltá a la **Fase 8**.
-> Igual leete los Prerrequisitos de allá.
-
 ---
 
 ## Fase 1 — Infra base con Terraform
 
+> **Repo:** `tochallenge-belo/` | **Ejecutar desde:** raíz del repo (donde está el `Makefile`)
+> **Comandos:** `make tf-* ENV=dev`
+
 Salida: VPC, subnets, NAT, ALB shell (lo crea el ALB Controller después),
-EKS, node group con un nodo `statefulls`, Karpenter, EBS de 20GB para el
-nodo statefull.
+EKS con 3 nodos (stateless, statefulls, cicd), Karpenter IAM, EBS 20GB para
+el nodo statefull.
 
 ### Prerrequisitos
 
@@ -53,30 +83,33 @@ nodo statefull.
 
 ### Pasos
 
-> **Importante:** todos los `make` se corren desde **la raíz del repo**
-> (donde está el `Makefile`), no desde dentro de `terraform/envs/dev`.
-> Cada target ya hace el `cd` interno al directorio que necesita.
-
 ```bash
-# Desde la raíz del repo:
+# Todo desde la raíz de tochallenge-belo/ (donde está el Makefile).
 
-# 1. Copiar y editar los archivos de configuración
+# 1. Copiar y editar los archivos de configuración para el ambiente dev
 cp terraform/bootstrap/terraform.tfvars.example terraform/bootstrap/terraform.tfvars
 cp terraform/envs/dev/backend.hcl.example       terraform/envs/dev/backend.hcl
 cp terraform/envs/dev/terraform.tfvars.example  terraform/envs/dev/terraform.tfvars
 # Editar los tres archivos (ver "Variables a editar" abajo)
 
-# 2. Crear bucket S3 + tabla DynamoDB para el state remoto (UNA SOLA VEZ por cuenta)
+# 2. Crear bucket S3 + tabla DynamoDB para el state remoto — UNA SOLA VEZ por cuenta
+#    (El bucket persiste entre destroy/apply y guarda el state de todos los ambientes)
 make tf-bootstrap
 
 # 3. Inicializar el backend del ambiente dev
-make tf-init
+make tf-init ENV=dev
 
 # 4. Ver qué se va a crear
-make tf-plan
+make tf-plan ENV=dev
 
-# 5. Aplicar (toma 15-20 minutos por EKS)
-make tf-apply
+# 5. Aplicar (toma 15-20 min por EKS)
+make tf-apply ENV=dev
+
+# ── Si ya aplicaste antes y destruiste (ciclo de demo) ──────────────────────
+# El tfplan previo quedó inválido. Reiniciar antes de planear de nuevo:
+make tf-reinit ENV=dev
+make tf-plan ENV=dev
+make tf-apply ENV=dev
 ```
 
 ### Variables a editar antes del paso 2
@@ -107,9 +140,9 @@ aws eks update-kubeconfig --name belo-challenge-dev --region us-east-1
 kubectl get nodes -L role
 # Esperado:
 # NAME             STATUS   ROLES    AGE   VERSION   ROLE
-# ip-10-0-...      Ready    <none>   3m    1.30      statefulls
-# ip-10-0-...      Ready    <none>   3m    1.30      stateless
-# ip-10-0-...      Ready    <none>   3m    1.30      stateless
+# ip-10-0-...      Ready    <none>   3m    1.35      statefulls
+# ip-10-0-...      Ready    <none>   3m    1.35      stateless
+# ip-10-0-...      Ready    <none>   3m    1.35      cicd
 ```
 
 ### Montar el EBS en el nodo statefull (paso a paso manual)
@@ -167,29 +200,41 @@ terraform destroy
 
 ## Fase 2 — Acceso al cluster, RBAC e IAM
 
+> **Repo:** `users-managment-aws/` | **Ejecutar desde:** raíz de ese repo (donde está su `Makefile`)
+> **Comandos:** `make iam-apply`, `make rbac-apply`, `make verify-developer`, `make verify-infra`
+
 Salida: dos grupos (`develop` e `infra`), dos usuarios IAM de ejemplo, el
-`aws-auth` configmap actualizado, ClusterRoles y ClusterRoleBindings para los
-permisos descritos en el challenge, y los archivos plantilla para crear más
-usuarios/grupos a futuro.
+`aws-auth` configmap actualizado con `merge-aws-auth.sh` (no pisado directo),
+`RBACDefinition` con rbac-manager para permisos diferenciados por namespace.
 
 Todo este código vive en el repo
 [users-managment-aws](https://github.com/Valentino-33/users-managment-aws).
 
+### Prerrequisito de Fase 2
+
+El cluster de la Fase 1 tiene que estar ACTIVE y kubeconfig configurado:
+
+```bash
+# Desde tochallenge-belo/
+make kubeconfig ENV=dev
+kubectl get nodes   # tiene que mostrar los 3 nodos Ready
+```
+
 ### Pasos
 
 ```bash
-git clone https://github.com/Valentino-33/users-managment-aws
-cd users-managment-aws
+# Clonar (o entrar si ya está clonado) al repo de auth
+cd ../users-managment-aws    # desde belochallenge/ si los repos son hermanos
 
-# 1. Crear los usuarios IAM y los grupos
-terraform -chdir=iam apply
+# 1. Crear usuarios IAM, grupos y roles en AWS
+make iam-apply
 
-# 2. Aplicar el aws-auth configmap (mapeo IAM → grupo K8s)
-kubectl apply -f rbac/aws-auth.yaml
+# 2. Actualizar el aws-auth ConfigMap (merge seguro, no pisa lo existente)
+make rbac-apply   # incluye el merge-aws-auth.sh y kubectl apply de los RBACDefinition
 
-# 3. Aplicar los ClusterRoles y bindings
-kubectl apply -f rbac/clusterroles/
-kubectl apply -f rbac/bindings/
+# 3. Verificar que los permisos están bien
+make verify-developer   # debe listar pods pero fallar al pedir secrets
+make verify-infra       # debe tener acceso completo
 ```
 
 ### Verificación
@@ -235,15 +280,51 @@ Los archivos para integrar OIDC (con Cognito, Okta, Auth0 o Google) están en
 
 ## Fase 3 — Addons del cluster
 
+> **Repo:** `tochallenge-belo/` | **Ejecutar desde:** raíz del repo (donde está el `Makefile`)
+> **Comandos:** `make addons ENV=dev` (o los `helm upgrade` individuales que se detallan abajo)
+> **Prerequisito:** kubeconfig apuntando al cluster (`make kubeconfig ENV=dev`)
+
 Salida: ALB Controller, nginx Ingress, Karpenter (su parte de software, ya
-que el rol IAM lo crea Terraform), ArgoCD, ArgoRollouts, Tekton + Triggers,
+que el rol IAM lo crea Terraform), **rbac-manager** (operator necesario para
+los `RBACDefinition` de la Fase 2), ArgoCD, ArgoRollouts, Tekton + Triggers,
 TestKube, EFK, Prometheus, Grafana, Headlamp, Metrics Server (para HPA), VPA.
 
+> **rbac-manager va PRIMERO.** Los `RBACDefinition` de la Fase 2 son CRDs que
+> necesitan el operator instalado para existir. Si instalás los otros addons
+> antes de rbac-manager, el `kubectl apply` de los bindings de la Fase 2 falla.
+
 Todos los addons se instalan vía Helm. La lista completa y sus values están en
-`helm/addons/`. La instalación está scripteada en `make addons`, pero para
-entenderla, esto es lo que hace por debajo:
+`helm/addons/`. La instalación está scripteada en `make addons ENV=dev`, pero
+para entenderla (y poder correr pasos individualmente), esto es lo que hace
+por debajo. Los repos de Helm se agregan una sola vez:
 
 ```bash
+# Agregar repos de Helm (una sola vez en la máquina)
+helm repo add fairwinds-stable  https://charts.fairwinds.com/stable
+helm repo add metrics-server    https://kubernetes-sigs.github.io/metrics-server/
+helm repo add eks               https://aws.github.io/eks-charts
+helm repo add ingress-nginx     https://kubernetes.github.io/ingress-nginx
+helm repo add argo              https://argoproj.github.io/argo-helm
+helm repo add testkube          https://kubeshop.github.io/helm-charts
+helm repo add elastic           https://helm.elastic.co
+helm repo add fluent            https://fluent.github.io/helm-charts
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+helm repo add headlamp          https://headlamp-k8s.github.io/headlamp/
+helm repo update
+
+# ── 1. rbac-manager (PRIMERO — los RBACDefinition de la Fase 2 necesitan este operator) ──
+helm upgrade --install rbac-manager fairwinds-stable/rbac-manager \
+  -n rbac-manager --create-namespace
+
+# Esperar a que el operator esté Ready antes de continuar
+kubectl -n rbac-manager rollout status deployment rbac-manager
+
+# Aplicar los RBACDefinition de la Fase 2 (si el cluster se recreó)
+# Ejecutar desde el repo users-managment-aws/
+cd ../users-managment-aws && make rbac-apply && cd -
+
+# ── 2. Resto de addons (desde tochallenge-belo/) ─────────────────────────────
+
 # Metrics server (necesario para HPA)
 helm upgrade --install metrics-server metrics-server/metrics-server \
   -n kube-system
@@ -340,42 +421,130 @@ kubectl get pods -A | grep -v Running
 
 ---
 
-## Fase 4 — Apps (webserver-api01 y webserver-api02)
+## Fase 4 — Helm charts maestros (belo-helm-charts)
 
-Salida: dos Helm charts publicados con las apps en Python, sus Dockerfiles,
-y la carpeta `loadtest/` con los k6 scripts asociados a cada estrategia.
+> **Repo:** `belo-helm-charts/` | **Ejecutar desde:** raíz de ese repo
+> **Comandos:** `helm lint`, `helm template --dry-run`
 
-El código vive en los repos
-[webserver-api01](https://github.com/Valentino-33/webserver-api01) y
+Salida: repo `belo-helm-charts` con el chart `pythonapps` completamente
+armado, verificado con `helm lint` y `helm template --dry-run`. Este chart
+es el contrato entre el CI/CD y el GitOps — define qué templates usa cada
+app y separa claramente qué es build-time de qué es runtime por ambiente.
+
+El código vive en [belo-helm-charts](https://github.com/Valentino-33/belo-helm-charts).
+
+### Estructura del repo
+
+```
+belo-helm-charts/
+└── pythonapps/                          ← chart maestro, replicable (javaapps, goapps…)
+    ├── Chart.yaml
+    ├── values.yaml                      ← defaults para que el chart funcione standalone
+    ├── templates/
+    │   ├── rollout.yaml                 ← ArgoRollout parametrizado por strategy
+    │   ├── service.yaml
+    │   ├── ingress.yaml
+    │   ├── servicemonitor.yaml
+    │   ├── hpa.yaml
+    │   └── pipeline-templates/          ← Tasks y Pipeline de Tekton para el stack Python
+    │       ├── task-clone.yaml
+    │       ├── task-build-kaniko.yaml
+    │       ├── task-push-gitops.yaml
+    │       ├── task-load-test.yaml      ← verifica si existen scripts k6; warning si no, nunca falla
+    │       └── pipeline-pythonapps.yaml
+    └── apps/
+        ├── webserver-api01/
+        │   ├── build-time/
+        │   │   └── app.yaml             ← image_name, registry, repo_url, owner
+        │   ├── dev/
+        │   │   └── values-api01-dev.yaml
+        │   ├── testing/
+        │   │   └── values-api01-testing.yaml
+        │   ├── lab/
+        │   │   └── values-api01-lab.yaml
+        │   ├── staging/
+        │   │   └── values-api01-staging.yaml
+        │   └── production/
+        │       └── values-api01-production.yaml
+        └── webserver-api02/
+            └── (misma estructura)
+```
+
+### build-time vs. runtime — por qué separados
+
+- **build-time** (`build-time/app.yaml`): registry, nombre de imagen, repo_url y
+  owner. Cambia raramente — solo cuando se migra el registry o se hace un fork.
+  Es metadata de la app, no del ambiente.
+- **runtime por ambiente** (`<env>/values-<app>-<env>.yaml`): réplicas, recursos,
+  strategy de deployment, hostname de Ingress, límites del HPA. Cambia seguido
+  y de forma independiente por ambiente.
+
+Los **pipeline-templates/** viven en `pythonapps/` porque son específicos del
+stack tecnológico. Una app Java usaría `javaapps/pipeline-templates/` con un
+task de Maven en lugar de pip. Los templates no son intercambiables entre stacks.
+
+### Composición en el pipeline
+
+```bash
+helm template api01 belo-helm-charts/pythonapps/ \
+  -f belo-helm-charts/pythonapps/apps/webserver-api01/build-time/app.yaml \
+  -f belo-helm-charts/pythonapps/apps/webserver-api01/dev/values-api01-dev.yaml \
+  --set image.tag=v1.4.0
+```
+
+### Verificación (dry-run antes de aplicar)
+
+```bash
+git clone https://github.com/Valentino-33/belo-helm-charts
+cd belo-helm-charts
+
+helm lint pythonapps/ \
+  -f pythonapps/apps/webserver-api01/build-time/app.yaml \
+  -f pythonapps/apps/webserver-api01/dev/values-api01-dev.yaml
+
+helm template api01 pythonapps/ \
+  -f pythonapps/apps/webserver-api01/build-time/app.yaml \
+  -f pythonapps/apps/webserver-api01/dev/values-api01-dev.yaml \
+  --set image.tag=v0.1.0 | kubectl apply --dry-run=client -f -
+```
+
+---
+
+## Fase 5 — Apps Python (webserver-api01 y webserver-api02)
+
+> **Repos:** `webserver-api01/` y `webserver-api02/` | **Ejecutar desde:** raíz de cada uno
+> **Comandos:** `docker build`, `docker push`
+
+Salida: código de las dos apps con Dockerfile, scripts de k6 en `loadtest/`,
+y el template de PipelineRun en `.tekton/`. **No hay `chart/` adentro** —
+los charts y templates de Tekton viven en `belo-helm-charts`.
+
+Repos: [webserver-api01](https://github.com/Valentino-33/webserver-api01) y
 [webserver-api02](https://github.com/Valentino-33/webserver-api02).
 
-Estructura de cada repo:
+### Estructura de cada repo
 
 ```
 webserver-apiNN/
 ├── Dockerfile
-├── pyproject.toml          # FastAPI + uvicorn + structlog + prometheus_client
+├── pyproject.toml          ← FastAPI + uvicorn + structlog + prometheus_client
 ├── app/
-│   ├── main.py             # endpoints /, /health, /version, /metrics
-│   ├── logging_config.py   # 5 levels (info, debug, error, warn, trace)
+│   ├── main.py             ← endpoints /, /health, /version, /metrics
+│   ├── logging_config.py   ← 5 niveles: trace, debug, info, warn, error
 │   └── ...
-├── chart/                  # Helm chart de la app
-│   ├── Chart.yaml
-│   ├── values.yaml
-│   └── templates/
-│       ├── rollout.yaml    # Rollout de ArgoCD (NO Deployment)
-│       ├── service.yaml
-│       ├── ingress.yaml
-│       ├── servicemonitor.yaml
-│       └── hpa.yaml
-├── loadtest/
+├── loadtest/               ← scripts k6 opcionales; si no existen el pipeline sigue con warning
 │   ├── smoke.js
-│   ├── load-bluegreen.js   # solo en api01
-│   ├── load-canary.js      # solo en api02
+│   ├── load-bluegreen.js   ← solo en api01 (BlueGreen pre-switch)
+│   ├── load-canary.js      ← solo en api02 (después de cada step de promoción)
 │   └── README.md
 └── .tekton/
-    └── pipelinerun.yaml    # template del PipelineRun que dispara Tekton
+    └── pipelinerun.yaml    ← template del PipelineRun que dispara Tekton
 ```
+
+> La presencia de `loadtest/` es opcional — el stage de load-test del Pipeline
+> verifica si los archivos k6 existen antes de correrlos. Si no están, escribe
+> un warning en el log del PipelineRun y continúa sin fallar. Esto permite que
+> el pipeline funcione desde el primer commit sin tener tests de carga listos.
 
 ### Build local de la imagen (smoke test)
 
@@ -391,60 +560,124 @@ curl localhost:8000/api01/metrics
 
 ### Push manual a Docker Hub
 
-Esto se hace una vez para tener una imagen base; después lo automatiza
-Tekton/Kaniko en cada commit.
+Una vez para tener imagen base; Tekton/Kaniko lo automatiza a partir de acá.
 
 ```bash
-docker tag local/api01:test docker.io/<tu-user>/api01:0.0.1
-docker push docker.io/<tu-user>/api01:0.0.1
+docker tag local/api01:test docker.io/valentinobruno/api01:0.0.1
+docker push docker.io/valentinobruno/api01:0.0.1
 ```
 
 ---
 
-## Fase 5 — GitOps (ArgoCD apps por ambiente)
+## Fase 6 — GitOps por ambiente (gitops-files)
 
-Salida: cuatro repos GitOps (test, develop, staging, production), cada uno
-con sus aplicaciones de ArgoCD apuntando a las charts de las apps.
+> **Repo:** `gitops-files/` | **Ejecutar desde:** raíz de ese repo para editar manifests;
+> el bootstrap se aplica desde cualquier lugar con kubeconfig configurado
+> **Comando de bootstrap:** `kubectl apply -f manifests/argocd/bootstrap.yaml` (desde `tochallenge-belo/`)
 
-Estructura del repo
-[gitops-files](https://github.com/Valentino-33/gitops-files):
+Salida: repo `gitops-files` con estructura apps-of-apps separada por ambiente.
+Cada ambiente tiene su propio "core" de ArgoCD que apunta a los values en
+`belo-helm-charts`. Los values no viven en `gitops-files` — ese repo solo
+contiene Application resources de ArgoCD.
+
+Repo: [gitops-files](https://github.com/Valentino-33/gitops-files).
+
+### Estructura del repo
 
 ```
 gitops-files/
-├── core/
-│   └── apps-of-apps.yaml       # ArgoCD Application root
-├── test/
-│   ├── api01/values.yaml
-│   └── api02/values.yaml
-├── develop/
-│   ├── api01/values.yaml
-│   └── api02/values.yaml
-├── staging/
+├── apps-of-apps.yaml               ← Application raíz — bootstrap de ArgoCD
+├── gitops-core-dev/
+│   ├── webserver-api01.yaml        ← Application de ArgoCD para api01 en dev
+│   └── webserver-api02.yaml
+├── gitops-core-testing/
+│   ├── webserver-api01.yaml
+│   └── webserver-api02.yaml
+├── gitops-core-lab/
 │   └── ...
-└── production/
+├── gitops-core-staging/
+│   └── ...
+└── gitops-core-production/
     └── ...
 ```
+
+### Por qué gitops-core-$env en lugar de una carpeta plana
+
+Tres motivos concretos:
+1. **Disaster recovery selectivo**: si production explota, revertís solo el core
+   de production sin tocar dev ni staging.
+2. **RBAC granular en ArgoCD**: distintos equipos o bots de deploy pueden tener
+   permiso de sync sobre distintos cores sin acceso cruzado.
+3. **Auditoría por ambiente**: el historial de `gitops-core-production/` es el
+   registro de cambios de producción — diff limpio y trazable.
+
+### Cómo se ve cada Application
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: webserver-api01-dev
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/Valentino-33/belo-helm-charts
+    targetRevision: main
+    path: pythonapps
+    helm:
+      valueFiles:
+        - apps/webserver-api01/build-time/app.yaml
+        - apps/webserver-api01/dev/values-api01-dev.yaml
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: apps-dev
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+```
+
+ArgoCD sincroniza directamente contra `belo-helm-charts`. El pipeline de Tekton
+solo necesita commitear el nuevo tag de imagen en el values del ambiente
+después de pushear la imagen a Docker Hub.
 
 ### Bootstrap en el cluster
 
 ```bash
-# Apuntar ArgoCD al repo (la primera vez)
+# Apuntar ArgoCD al repo gitops-files (la primera vez)
 kubectl apply -f manifests/argocd/bootstrap.yaml
 
-# Validar que ArgoCD se sincronizó
+# Validar que los cores se sincronizaron
 kubectl -n argocd get applications
 ```
 
-A partir de acá, **todo cambio de imagen, replicas o config va por commit al
-repo gitops-files**, no por kubectl. Es la regla del juego de GitOps.
+A partir de acá, **todo cambio de imagen, réplicas o config va por commit a
+`belo-helm-charts/pythonapps/apps/<app>/<env>/`**, no por kubectl.
 
 ---
 
-## Fase 6 — CI/CD con Tekton
+## Fase 7 — CI/CD con Tekton
+
+> **Manifests de pipeline:** `belo-helm-charts/pythonapps/templates/pipeline-templates/`
+> **Template de PipelineRun:** `.tekton/pipelinerun.yaml` en cada repo de app
+> **Comandos de operación:** `tkn` CLI con kubeconfig del cluster activo
+> **Disparo:** `git tag -a deploy:<env> -m "strategy:<BlueGreen|Canary|RollingUpdate>" <version>`
 
 Salida: EventListener escuchando webhooks de GitHub, Pipeline que cubre
 Blue/Green, Canary y RollingUpdate según el `tag annotated`, y los stages
 de k6 integrados.
+
+> **Nodo dedicado:** todos los PipelineRuns corren en el nodo con label
+> `role=cicd` mediante toleration `workload=cicd:NoSchedule`. Los
+> manifests en `pipeline-templates/` ya incluyen ese toleration — no hay
+> que setearlo a mano. El nodo cicd es un t3.medium separado de los workers
+> de aplicación, así un build pesado no impacta en la latencia de las apps.
+
+> **Load tests opcionales:** el stage `load-test` verifica si los scripts
+> k6 existen en `loadtest/` del repo de la app antes de correrlos. Si no
+> están, loguea `WARN: no k6 scripts found, skipping load test stage` y
+> continúa. El PipelineRun nunca falla por ausencia de scripts de carga.
 
 ### El Pipeline en alto nivel
 
@@ -528,7 +761,10 @@ tkn pipeline start app-deploy-pipeline \
 
 ---
 
-## Fase 7 — Observabilidad
+## Fase 8 — Observabilidad
+
+> **Ejecutar desde:** cualquier lugar con kubeconfig del cluster activo
+> **Comandos:** `kubectl port-forward`, importación de dashboards en Grafana/Kibana
 
 Ya quedó instalado en la Fase 3. Acá solo se agregan los dashboards y se
 valida que los logs y métricas fluyan.
@@ -577,68 +813,11 @@ Configurable vía variable de entorno `LOG_LEVEL`.
 
 ---
 
-## Fase 8 — Versión local con k3d
-
-Para correr todo el stack en tu máquina sin AWS. Útil para iterar pipelines
-sin gastar y para hacer la POC si el costo en AWS no es viable.
-
-### Prerrequisitos
-
-- [ ] Docker Desktop o Docker Engine
-- [ ] k3d 5.6+
-- [ ] kubectl, helm
-- [ ] Al menos 8GB de RAM disponibles para los contenedores
-
-### Pasos
-
-```bash
-make k3d-up
-```
-
-Ese target hace:
-
-1. Crea un cluster k3d con 1 server + 3 agents.
-2. Pone label `role=statefulls` en uno de los agents (el primero).
-3. Crea un volumen Docker de 20GB y lo monta en ese nodo (equivalente al EBS).
-4. Instala todos los addons con los mismos values que en AWS, salvo:
-   - **ALB Controller:** se reemplaza por Traefik (que viene con k3d) +
-     un Service NodePort.
-   - **Karpenter:** se desactiva (no aplica fuera de AWS).
-   - **NAT Gateway / VPC:** Docker network nativa.
-5. Levanta ArgoCD apuntando al mismo repo gitops-files (sí, podés tener
-   ambientes "local" además de los cuatro de AWS).
-6. Levanta Tekton + TestKube igual que en AWS.
-7. Hace port-forward a los servicios principales y los expone en:
-   - ArgoCD → http://localhost:8080
-   - Headlamp → http://localhost:8081
-   - Grafana → http://localhost:8082
-   - Kibana → http://localhost:8083
-
-### Diferencias funcionales con AWS
-
-| Componente | AWS | k3d |
-|---|---|---|
-| Ingress externo | ALB | Traefik (NodePort) |
-| Storage statefull | EBS | Docker volume |
-| DNS público | Route53 | /etc/hosts local |
-| TLS | ACM cert | Self-signed con cert-manager |
-| Logs externos | CloudWatch | Solo EFK interno |
-| Autoscaling de nodos | Karpenter | Sin autoscaling, capacity fija |
-
-Lo que **sí funciona idéntico:** los Helm charts de las apps, los manifestos
-de Rollout, los Pipelines de Tekton, los scripts de k6, las queries de
-Prometheus, los dashboards. Eso es justamente lo lindo de Kubernetes —
-mismo manifiesto, distinta infra debajo.
-
-### Bajar todo
-
-```bash
-make k3d-down
-```
-
----
-
 ## Apéndice A — Troubleshooting frecuente
+
+> **Referencia de fases:** Fase 1 Infra → Fase 2 Auth → Fase 3 Addons
+> → Fase 4 Helm charts maestros → Fase 5 Apps Python → Fase 6 GitOps →
+> Fase 7 Tekton CI/CD → Fase 8 Observabilidad.
 
 ### "Terraform apply falla en el destroy del NAT Gateway"
 
@@ -682,9 +861,14 @@ el dominio público. El k6 corre dentro del cluster.
 
 | Fase | Costo aproximado mensual (siempre prendido) | Notas |
 |------|---------------------------------------------|-------|
-| Fase 1 (infra base) | ~$200 | EKS + 3 nodos + NAT + ALB + EBS + IPs |
-| Fases 2-7 (software) | $0 | Todo es OSS y corre dentro del cluster |
-| **Total** | **~$200** | Ver [COSTS.md](./COSTS.md) para el detalle |
+| Fase 1 (infra base) | ~$210 | EKS + 3 nodos (1×t3.large + 2×t3.medium) + NAT + ALB + EBS + IPs |
+| Fases 2-9 (software) | $0 | Todo es OSS y corre dentro del cluster |
+| **Total** | **~$210** | Ver [COSTS.md](./COSTS.md) para el detalle |
+
+> Los 3 nodos son ahora: `statefulls` (t3.large), `stateless` (t3.medium) y
+> `cicd` (t3.medium). Un t3.medium extra vs. el setup anterior de 2×t3.medium
+> resulta en el mismo costo — la diferencia es que ahora hay 1 worker de apps
+> y 1 worker de CI/CD en lugar de 2 workers mixtos.
 
 Si destruyas con `make tf-destroy` cuando no estás trabajando, el costo
 real puede bajar a $20-40 USD/mes según el tiempo activo.

@@ -1,0 +1,13 @@
+global:
+  imageRegistry: ""
+testkube-api:
+  nodeSelector:
+    role: cicd
+  tolerations:
+  - key: workload
+    operator: Equal
+    value: cicd
+    effect: NoSchedule
+testkube-dashboard:
+  nodeSelector:
+    role: stateless

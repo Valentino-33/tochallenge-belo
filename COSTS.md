@@ -239,19 +239,6 @@ este stack.
 
 ---
 
-## Costo de la versión local (k3d)
-
-**$0**. Solo corre la luz de tu PC. Por eso vale la pena tenerla — para
-iterar pipelines, validar manifiestos y hacer demos sin tener que prender
-el clúster real.
-
-La única consideración es la **RAM**: el stack completo en k3d toma
-**6-8 GiB**. En una notebook con 16 GiB de RAM corre cómodo si cerrás
-Chrome con muchas pestañas. Con 8 GiB se puede levantar una versión
-recortada (sin EFK ni Prometheus) que pesa ~3 GiB.
-
----
-
 ## Resumen ejecutivo (para si te lo preguntan en una reunión)
 
 > **"¿Cuánto sale esto por mes?"**

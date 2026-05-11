@@ -29,8 +29,8 @@ flowchart TB
             subgraph PRIV["Private subnets - 10.0.16.0/20 + 10.0.32.0/20"]
                 subgraph NODES["EKS worker nodes"]
                     SF["Node 'statefulls' - t3.large<br/>label: role=statefulls"]
-                    SL1["Node stateless 1 - t3.medium"]
-                    SL2["Node stateless 2 - t3.medium"]
+                    SL1["Node 'stateless' - t3.medium<br/>label: role=stateless"]
+                    CI["Node 'cicd' - t3.medium<br/>label: role=cicd<br/>taint: workload=cicd:NoSchedule"]
                 end
                 EBS[("EBS gp3 20GB<br/>mounted /mnt/statefull")]
             end
@@ -42,25 +42,25 @@ flowchart TB
     Internet <--> IGW
     IGW <--> ALB
     ALB --> SL1
-    ALB --> SL2
     SL1 -.outbound.-> NAT
-    SL2 -.outbound.-> NAT
+    CI  -.outbound.-> NAT
     SF  -.outbound.-> NAT
     NAT --> IGW
     GH  -.webhook.-> ALB
     NAT -.pull images.-> DH
     NAT -.git clone.-> GH
+    NAT -.pip/deps.-> Internet
     SF --- EBS
 
     CP -.manages.-> SF
     CP -.manages.-> SL1
-    CP -.manages.-> SL2
+    CP -.manages.-> CI
 
     classDef public fill:#fef3c7,stroke:#f59e0b,color:#000
     classDef private fill:#dbeafe,stroke:#3b82f6,color:#000
     classDef external fill:#f3f4f6,stroke:#6b7280,color:#000
     class PUB,ALB,NAT public
-    class PRIV,NODES,SF,SL1,SL2,EBS private
+    class PRIV,NODES,SF,SL1,CI,EBS private
     class GH,DH,Dev,Internet external
 ```
 
@@ -116,7 +116,7 @@ flowchart LR
         AR[ArgoRollouts<br/>controller]
     end
 
-    subgraph ns_tekton["namespace: tekton-pipelines + tekton-triggers"]
+    subgraph ns_tekton["namespace: tekton-pipelines + tekton-triggers<br/>(corre en nodo cicd)"]
         TK[Tekton Pipelines]
         TT[Tekton Triggers<br/>EventListener]
         TKB[TestKube]
@@ -289,42 +289,24 @@ BlueGreen alcanza con ALB nomás (es un switch atómico de target group).
 
 ## 4. Mapa de qué corre dónde
 
-| Componente | Ambiente | Dónde corre | Tipo |
+| Componente | Dónde corre | Tipo | Notas |
 |---|---|---|---|
-| EKS Control Plane | AWS managed | (no es tu workload) | managed |
-| Worker nodes | EC2 | private subnets | EC2 |
-| Karpenter | nodos | kube-system | Deployment |
-| ALB Controller | nodos | kube-system | Deployment |
-| nginx Ingress | nodos | ingress-nginx | Deployment |
-| ArgoCD | nodos | argocd | Deployment + StatefulSet (repo-server) |
-| ArgoRollouts | nodos | argo-rollouts | Deployment |
-| Tekton Pipelines | nodos | tekton-pipelines | Deployment |
-| TestKube | nodos | testkube | Deployment |
-| Elasticsearch | nodo statefulls | logging | StatefulSet |
-| Prometheus | nodo statefulls | monitoring | StatefulSet |
-| Grafana, Kibana, Headlamp | nodos stateless | varios | Deployment |
-| Apps (api01, api02) | nodos stateless | apps | Rollout (no Deployment) |
+| EKS Control Plane | AWS managed | managed | |
+| Karpenter | stateless | kube-system Deployment | escala los nodos stateless |
+| ALB Controller | stateless | kube-system Deployment | IRSA con rol Terraform |
+| nginx Ingress | stateless | ingress-nginx Deployment | routing canary fino |
+| ArgoCD | stateless | argocd Deployment | apunta a belo-helm-charts |
+| ArgoRollouts | stateless | argo-rollouts Deployment | controla BlueGreen y Canary |
+| rbac-manager | stateless | rbac-manager Deployment | operator de RBACDefinition |
+| Grafana, Kibana, Headlamp | stateless | varios Deployment | |
+| Apps (api01, api02) | stateless | apps Rollout | NO Deployment, ArgoRollout |
+| Tekton controller | cicd | tekton-pipelines Deployment | toleration workload=cicd |
+| Tekton EventListener | cicd | tekton-pipelines Deployment | webhook desde GitHub |
+| TestKube | cicd | testkube Deployment | lanza los tests k6 |
+| PipelineRuns (pods) | cicd | tekton-pipelines Pod efímero | PVC gp3 de 1 GiB, se borra al terminar |
+| Elasticsearch | statefulls | logging StatefulSet | pinneado, datos en /mnt/statefull |
+| Prometheus | statefulls | monitoring StatefulSet | pinneado, datos en /mnt/statefull |
 
----
-
-## 5. Equivalencias en k3d (para la versión local)
-
-| AWS | k3d |
-|---|---|
-| EKS Control Plane | Container `k3d-<cluster>-server-0` |
-| Worker nodes EC2 | Containers `k3d-<cluster>-agent-N` |
-| `role=statefulls` | Label puesto a un agent específico al crear el cluster |
-| EBS gp3 | Docker volume montado al agent statefull |
-| ALB | Traefik (built-in en k3s) + Service NodePort |
-| NAT Gateway | Network NAT de Docker (transparente) |
-| Internet Gateway | Bridge `docker0` |
-| Karpenter | **Sin equivalente** — los agents son fijos, no escala |
-| Route53 / DNS | `/etc/hosts` local + `*.localhost` |
-| ACM (TLS certs) | cert-manager con self-signed CA |
-
-Todo lo que es **manifiestos de Kubernetes** (Helm charts, Rollouts, Pipelines,
-ServiceMonitors, etc.) es **idéntico** en ambos. Solo cambia la capa de
-infraestructura debajo.
 
 ---
 

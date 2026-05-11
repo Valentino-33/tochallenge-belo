@@ -5,7 +5,7 @@ variable "region" {
 
 variable "cluster_name" {
   type    = string
-  default = "belo-challenge-dev"
+  default = "belo-challenge-staging"
 }
 
 variable "kubernetes_version" {
@@ -14,7 +14,7 @@ variable "kubernetes_version" {
 
 variable "vpc_cidr" {
   type    = string
-  default = "10.0.0.0/16"
+  default = "10.3.0.0/16"
 }
 
 variable "azs" {
@@ -24,16 +24,16 @@ variable "azs" {
 
 variable "public_subnet_cidrs" {
   type    = list(string)
-  default = ["10.0.0.0/24", "10.0.1.0/24"]
+  default = ["10.3.0.0/24", "10.3.1.0/24"]
 }
 
 variable "private_subnet_cidrs" {
   type    = list(string)
-  default = ["10.0.16.0/20", "10.0.32.0/20"]
+  default = ["10.3.16.0/20", "10.3.32.0/20"]
 }
 
 variable "endpoint_public_access_cidrs" {
-  description = "CIDRs autorizados a hablar con la API de EKS. Restringir en producción real."
+  description = "CIDRs autorizados a hablar con la API de EKS. Restringir a VPN/oficina en staging."
   type        = list(string)
   default     = ["0.0.0.0/0"]
 }

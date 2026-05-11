@@ -14,8 +14,7 @@
 
 Challenge técnico para una vacante en Belo. El alcance es armar una
 plataforma completa sobre EKS con CI/CD GitOps, observabilidad, load
-testing, dos APIs con estrategias de deployment Blue/Green y Canary, y una
-versión paralela en k3d para correr local.
+testing, y dos APIs con estrategias de deployment Blue/Green y Canary.
 
 El challenge lo pensó el dueño (Valentino) en términos de arquitectura;
 Claude está ayudando a materializarlo en código y documentación.
@@ -95,7 +94,12 @@ ROADMAP global.
 - **Build:** Docker Hub user `valentinobruno`. Imágenes públicas.
 
 ### Infra
-- **Nodos:** 2 × t3.medium stateless + 1 × t3.large statefulls
+- **Nodos:** 1 × t3.medium stateless + 1 × t3.large statefulls + 1 × t3.medium cicd
+  - `stateless`: workers de las apps (api01, api02). Karpenter puede escalar hasta 4.
+  - `statefulls`: Elasticsearch + Prometheus. Pinneado con taint + EBS dedicado.
+  - `cicd`: exclusivo para Tekton. Taint `workload=cicd:NoSchedule`. PVCs efímeros
+    de 1 GiB por PipelineRun (gp3 dinámico). Acceso a internet vía NAT para clonar
+    repos, bajar deps Python/Docker y pushear imágenes a Docker Hub.
 - **EBS:** 20GB gp3 dedicado al nodo `statefulls`, con script de bootstrap
   que lo attachea y monta en `/mnt/statefull` + symlinks a
   `/var/lib/elasticsearch`, `/var/lib/prometheus`.
@@ -105,8 +109,10 @@ ROADMAP global.
 - **Ingress dual:** ALB Controller (TLS, entry point) + nginx Ingress
   (routing canary fino, annotations nativas para ArgoRollouts).
 - **Cluster name:** `belo-challenge-dev`.
-- **AMIs:** pin de AMI aplicado en commit `18460ea` —
-  preservar lo que está en el repo, no revertir.
+- **AMIs:** Ubuntu 24.04 LTS vía SSM de Canonical
+  (`/aws/service/canonical/ubuntu/eks/24.04/<k8s_version>/stable/current/amd64/hvm/ebs-gp2/ami-id`).
+  Migrado desde AL2023 porque las AMIs AL2023 para k8s 1.35 estaban deprecadas.
+  Los tres node groups usan `ami_type = "CUSTOM"` con launch template propio.
 
 ### CI/CD
 - **Pipelines:** Tekton + Triggers, disparados por **tag annotated** con
@@ -295,90 +301,115 @@ Probada con éxito sobre cluster levantado. Las verificaciones
 
 ---
 
-## Cambio de arquitectura conversado pero NO implementado todavía
+## Arquitectura de charts (decidida y actualizada en código/docs)
 
-Después de entregar Fase 2, surgió un refinamiento importante sobre cómo
-estructurar los Helm charts. La propuesta original (chart adentro del repo
-de cada app) **se descarta**. La nueva arquitectura es:
+La propuesta original (chart adentro del repo de cada app) **se descarta**.
+La arquitectura definitiva separa tres capas en dos repos.
 
-### Repo `belo-helm-charts` (NUEVO)
+### Repo `belo-helm-charts` (estructura definitiva)
 
 ```
 belo-helm-charts/
-└── pythonapps/                          ← chart maestro reutilizable
+└── pythonapps/                          ← chart maestro, replicable (javaapps, goapps…)
     ├── Chart.yaml
-    ├── values.yaml                      ← defaults para que funcione standalone
+    ├── values.yaml                      ← defaults standalone
     ├── templates/
-    │   ├── rollout.yaml                 ← ArgoRollout (no Deployment)
+    │   ├── rollout.yaml                 ← ArgoRollout parametrizado por strategy
     │   ├── service.yaml
     │   ├── ingress.yaml
     │   ├── servicemonitor.yaml
-    │   └── hpa.yaml
+    │   ├── hpa.yaml
+    │   └── pipeline-templates/          ← Tasks/Pipeline de Tekton del stack Python
+    │       ├── task-clone.yaml
+    │       ├── task-build-kaniko.yaml
+    │       ├── task-push-gitops.yaml
+    │       ├── task-load-test.yaml      ← warning si no hay k6, nunca falla
+    │       └── pipeline-pythonapps.yaml
     └── apps/
         ├── webserver-api01/
-        │   └── app.yaml                 ← build-time: registry, image_name, repo_url
+        │   ├── build-time/
+        │   │   └── app.yaml             ← image_name, registry, repo_url, owner
+        │   ├── dev/
+        │   │   └── values-api01-dev.yaml
+        │   ├── testing/
+        │   │   └── values-api01-testing.yaml
+        │   ├── lab/
+        │   │   └── values-api01-lab.yaml
+        │   ├── staging/
+        │   │   └── values-api01-staging.yaml
+        │   └── production/
+        │       └── values-api01-production.yaml
         └── webserver-api02/
-            └── app.yaml
+            └── (misma estructura)
 ```
 
-Mañana se sumarían `javaapps/`, `goapps/`, etc.
-
-### Repo `gitops-files`
+### Repo `gitops-files` (estructura definitiva)
 
 ```
 gitops-files/
-├── dev/
-│   ├── webserver-api01/values.yaml      ← runtime: replicas, resources, strategy
-│   └── webserver-api02/values.yaml
-├── staging/...
-└── production/...
+├── apps-of-apps.yaml               ← Application raíz (bootstrap de ArgoCD)
+├── gitops-core-dev/
+│   ├── webserver-api01.yaml        ← Application CR de ArgoCD
+│   └── webserver-api02.yaml
+├── gitops-core-testing/
+├── gitops-core-lab/
+├── gitops-core-staging/
+└── gitops-core-production/
 ```
+
+`gitops-files` solo contiene Application CRDs de ArgoCD. Los values de cada
+app y ambiente viven en `belo-helm-charts/pythonapps/apps/<app>/<env>/`.
+Separar por `gitops-core-$env` permite disaster recovery selectivo y RBAC
+granular en ArgoCD por ambiente.
 
 ### Composición final en el pipeline
 
 ```bash
 helm template api01 belo-helm-charts/pythonapps/ \
-  -f belo-helm-charts/pythonapps/apps/webserver-api01/app.yaml \
-  -f gitops-files/dev/webserver-api01/values.yaml \
+  -f belo-helm-charts/pythonapps/apps/webserver-api01/build-time/app.yaml \
+  -f belo-helm-charts/pythonapps/apps/webserver-api01/dev/values-api01-dev.yaml \
   --set image.tag=v1.4.0
 ```
 
 ### Por qué se separa build-time de runtime
 
-- Build-time (cómo se compila, dónde se pushea, quién es dueño): cambia
-  **raramente**. Vive en `belo-helm-charts/apps/<app>/app.yaml`.
-- Runtime (replicas, recursos, strategy, hpa, ingress hostname): cambia
-  **seguido y por ambiente**. Vive en `gitops-files/<env>/<app>/values.yaml`.
+- **Build-time** (`build-time/app.yaml`): registry, image_name, repo_url, owner.
+  Cambia raramente. Vive con el chart, no con el ambiente.
+- **Runtime por ambiente** (`<env>/values-<app>-<env>.yaml`): réplicas, recursos,
+  strategy, HPA, hostname. Cambia seguido e independientemente por ambiente.
+- **`gitops-files`**: no tiene values — solo referencia Application CRs que
+  apuntan a los values en `belo-helm-charts`.
 
-### Decisiones pendientes (preguntadas pero no respondidas todavía por Valentino)
+### Decisiones confirmadas (10 de mayo 2026)
 
-1. **¿Un solo chart `pythonapps` parametrizado con `strategy:
-   bluegreen|canary|rollingupdate`, o dos charts separados (`pythonapps-bg`
-   y `pythonapps-canary`)?** Recomendación de Claude: uno solo.
-2. **¿Carpeta `loadtest/` queda en el repo de cada app?** Asumido confirmado
-   salvo nuevo input.
-3. **¿La capa "build-time" la dejamos en `belo-helm-charts/apps/`?**
-   Recomendado por Claude. Pendiente confirmación final.
+1. **Un solo chart `pythonapps`** parametrizado con `strategy: bluegreen|canary|rollingupdate`.
+   No hay charts separados por strategy. ✅
+2. **`loadtest/` vive en el repo de cada app.** Si los archivos k6 no existen,
+   el stage de load-test del Pipeline genera un `WARN` en los logs y continúa
+   sin fallar. El PipelineRun nunca falla por ausencia de scripts de carga. ✅
+3. **Build-time en `belo-helm-charts/pythonapps/apps/<app>/build-time/app.yaml`.**
+   Runtime por ambiente en `belo-helm-charts/pythonapps/apps/<app>/<env>/values-<app>-<env>.yaml`.
+   Los values NO viven en `gitops-files` — ese repo solo contiene Application CRs de ArgoCD. ✅
 
 ---
 
-## Roadmap actualizado (post-cambio de arquitectura)
+## Roadmap actualizado
 
 | Fase | Estado | Repos involucrados |
 |---|---|---|
-| 1 — Infra Terraform | ✅ Mergeado, validado, con fixes locales del dueño | tochallenge-belo |
-| 2 — Auth/RBAC/IAM | ✅ Entregado, aplicado con éxito | users-managment-aws |
-| 3 — Addons cluster | ⏳ Próxima | tochallenge-belo (Helm values) + gitops-files (apps-of-apps) |
-| 4 — Helm charts maestros | ⏳ Próxima (re-diseñada) | belo-helm-charts |
-| 5 — Apps Python | ⏳ | webserver-api01, webserver-api02 |
-| 6 — Pipelines Tekton | ⏳ | tochallenge-belo (manifests/tekton) + repos de apps (.tekton/) |
-| 7 — GitOps por ambiente | ⏳ | gitops-files |
+| 1 — Infra Terraform | ✅ Validada — **listo para re-aplicar** | tochallenge-belo |
+| 2 — Auth/RBAC/IAM | ✅ Aplicada con éxito — **listo para re-aplicar** | users-managment-aws |
+| 3 — Addons cluster | ⏳ Próxima — rbac-manager primero | tochallenge-belo (Helm values) |
+| 4 — Helm charts maestros | ⏳ Próxima | belo-helm-charts |
+| 5 — Apps Python (código, no chart) | ⏳ | webserver-api01, webserver-api02 |
+| 6 — GitOps por ambiente | ⏳ | gitops-files (gitops-core-$env) |
+| 7 — Pipelines Tekton (nodo cicd) | ⏳ | tochallenge-belo (manifests/tekton) + belo-helm-charts (pipeline-templates) |
 | 8 — Observabilidad (validación) | ⏳ | Dashboards Grafana, validación EFK |
-| 9 — Versión k3d | ⏳ | tochallenge-belo (k3d/ folder) |
-| 10 — READMEs finales + roadmap final + capítulo "Path to production" | ⏳ | tochallenge-belo |
+| 9 — READMEs finales + path-to-production | ⏳ | tochallenge-belo |
 
-> **Nota sobre orden:** Fase 4 antes que Fase 5 porque el chart maestro
-> define la interfaz de qué espera Helm de cada app.
+> **Orden de dependencia:** Fase 4 (chart maestro define la interfaz) antes
+> que Fase 5 (apps Python que la usan). Fase 6 (Application CRs) antes que
+> Fase 7 (pipeline que los comitea).
 
 ---
 
@@ -548,6 +579,11 @@ Antes de cerrar la respuesta:
 
 - ❌ Apply de Terraform sin haber configurado `backend.hcl` y `terraform.tfvars`
   → falla con error de "config files".
+- ❌ `make tf-plan` / `make tf-apply` sin `ENV=<ambiente>` cuando no es dev → apunta al dir equivocado.
+  Siempre pasar `ENV=` explícitamente en entornos distintos al default.
+- ❌ Reusar el `tfplan` binario de un ciclo anterior (post-destroy) → Terraform rechaza el plan
+  con "Saved plan is stale". Solución: `make tf-reinit ENV=<env>` borra el caché local y
+  el tfplan viejo, después `make tf-plan ENV=<env>` genera uno fresco.
 - ❌ Doble Ctrl+C en un `terraform apply` que está creando recursos lentos
   (EKS, NAT) → state inconsistente.
 - ❌ `prevent_destroy = true` por default en recursos que se van a destruir
@@ -573,9 +609,11 @@ Antes de cerrar la respuesta:
 
 ---
 
-*Última actualización: 10 de mayo de 2026 — cerrando este chat después de
-entregar Fase 1 (validada y commiteada en `tochallenge-belo@18460ea` con
-fixes del dueño: AMIs pinneadas y K8s 1.35) y Fase 2 (aplicada con éxito
-y commiteada en `users-managment-aws@6aff2bd`, con tres iteraciones de
-fix durante testing real). Próximo paso: retomar en Claude Code y
-arrancar con Fase 3 o Fase 4 según elección del dueño.*
+*Última actualización: 10 de mayo de 2026 (sesión 3 en Claude Code) —
+Migración de AMIs de AL2023 a Ubuntu 24.04 LTS. Las AMIs de Amazon Linux 2023
+para k8s 1.35 estaban deprecadas y bloqueaban el `make tf-apply`. Cambios:
+SSM parameter path a Canonical Ubuntu 24.04, `ami_type = "CUSTOM"` en los tres
+node groups, launch templates propios para stateless y cicd, bootstrap scripts
+actualizados (Ubuntu usa `/etc/eks/bootstrap.sh` en lugar de nodeadm). Próximo
+paso: `make tf-apply ENV=dev`, después `make rbac-apply` en `users-managment-aws`,
+después `make addons` para Fase 3.*

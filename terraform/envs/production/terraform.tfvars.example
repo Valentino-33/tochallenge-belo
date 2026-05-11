@@ -1,0 +1,21 @@
+# Ambiente: production
+# LEER ANTES DE APLICAR: production tiene datos reales. Cualquier destroy acá
+# es una interrupción de servicio. Seguir el proceso de change management.
+#
+# Diferencias clave respecto a dev/staging:
+#   - endpoint_public_access_cidrs: restringido a IPs conocidas (VPN, oficina)
+#   - prevent_destroy en recursos críticos: activar si se va a producción real
+#   - NAT por AZ (no uno solo): agregar segundo NAT en variables si se implementa
+#
+# Por ahora (demo): mismo tamaño que staging, con el cluster name diferente.
+
+region             = "us-east-1"
+cluster_name       = "belo-challenge-production"
+kubernetes_version = "1.35"
+dockerhub_user     = "valentinobruno"
+
+# ubuntu-eks/k8s_1.35/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-20260429
+ami_id = "ami-0bbcc28a769c6008a"
+
+# OBLIGATORIO en producción: restringir a IPs conocidas.
+# endpoint_public_access_cidrs = ["VPN_IP/32", "OFFICE_IP/32"]

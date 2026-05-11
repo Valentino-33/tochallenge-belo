@@ -67,47 +67,79 @@ alb-policy:  ## Bajar el iam_policy.json del ALB Controller (versión $(ALB_POLI
 	@echo "$(GREEN)✓ Guardado en $(ALB_POLICY_PATH)$(NC)"
 
 .PHONY: tf-init
-tf-init: alb-policy  ## terraform init con backend remoto
+tf-init: alb-policy  ## terraform init con backend remoto (ENV=$(ENV))
+	@echo "$(YELLOW)→ Inicializando Terraform para ambiente '$(ENV)' — dir: $(TF_DIR)$(NC)"
 	@if [ ! -f $(TF_DIR)/backend.hcl ]; then \
 		echo "$(RED)Falta $(TF_DIR)/backend.hcl$(NC)"; \
-		echo "Copialo de backend.hcl.example y editá el bucket name."; \
+		echo "Copiá $(TF_DIR)/backend.hcl.example y editá el bucket name."; \
+		exit 1; \
+	fi
+	@if [ ! -f $(TF_DIR)/terraform.tfvars ]; then \
+		echo "$(RED)Falta $(TF_DIR)/terraform.tfvars$(NC)"; \
+		echo "Copiá $(TF_DIR)/terraform.tfvars.example y editá los valores."; \
 		exit 1; \
 	fi
 	cd $(TF_DIR) && terraform init -backend-config=backend.hcl
+	@echo "$(GREEN)✓ Init OK — ambiente: $(ENV)$(NC)"
+
+.PHONY: tf-reinit
+tf-reinit:  ## Re-init limpio: borra caché local y vuelve a inicializar (usar después de destroy o si el state quedó roto)
+	@echo "$(YELLOW)→ Limpiando caché local de Terraform para '$(ENV)'...$(NC)"
+	rm -f $(TF_DIR)/tfplan
+	rm -rf $(TF_DIR)/.terraform
+	rm -f $(TF_DIR)/.terraform.lock.hcl
+	"$(MAKE)" tf-init ENV=$(ENV)
+	@echo "$(GREEN)✓ Re-init OK — listo para 'make tf-plan ENV=$(ENV)'$(NC)"
 
 .PHONY: tf-plan
-tf-plan:  ## terraform plan de la infra del ambiente $(ENV)
+tf-plan:  ## Generar plan fresco de infra para ENV=$(ENV) — descarta cualquier plan previo
+	@echo "$(YELLOW)→ Generando plan para ambiente '$(ENV)' — dir: $(TF_DIR)$(NC)"
 	@if [ ! -f $(TF_DIR)/terraform.tfvars ]; then \
 		echo "$(RED)Falta $(TF_DIR)/terraform.tfvars$(NC)"; \
-		echo "Copialo de terraform.tfvars.example."; \
+		echo "Copiá $(TF_DIR)/terraform.tfvars.example y editá los valores."; \
 		exit 1; \
 	fi
+	@if [ ! -d $(TF_DIR)/.terraform ]; then \
+		echo "$(YELLOW)→ .terraform/ no existe, corriendo tf-init primero...$(NC)"; \
+		"$(MAKE)" tf-init ENV=$(ENV); \
+	fi
+	@rm -f $(TF_DIR)/tfplan
 	cd $(TF_DIR) && terraform plan -out=tfplan
+	@echo ""
+	@echo "$(GREEN)✓ Plan listo en $(TF_DIR)/tfplan$(NC)"
+	@echo "$(YELLOW)Revisá el diff y después: make tf-apply ENV=$(ENV)$(NC)"
 
 .PHONY: tf-apply
-tf-apply:  ## Aplicar la infra (toma 15-20 min por EKS)
+tf-apply:  ## Aplicar la infra de ENV=$(ENV) — toma 15-20 min por EKS
 	@if [ ! -f $(TF_DIR)/tfplan ]; then \
-		echo "$(YELLOW)No hay tfplan, corriendo plan primero...$(NC)"; \
-		"$(MAKE)" tf-plan; \
+		echo "$(YELLOW)→ No hay plan generado, corriendo tf-plan primero...$(NC)"; \
+		"$(MAKE)" tf-plan ENV=$(ENV); \
 	fi
 	cd $(TF_DIR) && terraform apply tfplan
+	@rm -f $(TF_DIR)/tfplan
 	@echo ""
-	@echo "$(GREEN)✓ Infra desplegada$(NC)"
-	@echo "$(YELLOW)Próximo: 'make kubeconfig' y después 'make addons'$(NC)"
+	@echo "$(GREEN)✓ Infra desplegada — ambiente: $(ENV)$(NC)"
+	@echo "$(YELLOW)Próximo: make kubeconfig ENV=$(ENV) — después: make addons ENV=$(ENV)$(NC)"
 
 .PHONY: tf-destroy
-tf-destroy:  ## Destruir TODA la infra del ambiente $(ENV)
+tf-destroy:  ## Destruir TODA la infra de ENV=$(ENV) — IRREVERSIBLE
 	@echo "$(RED)⚠  Esto va a destruir toda la infra de '$(ENV)'.$(NC)"
-	@echo "$(RED)   El bucket de tfstate y el EBS statefull NO se destruyen (prevent_destroy).$(NC)"
+	@echo "$(RED)   El bucket de tfstate NO se destruye (contiene el state de todos los envs).$(NC)"
 	@read -p "Escribí '$(ENV)' para confirmar: " confirm; \
 	if [ "$$confirm" != "$(ENV)" ]; then \
 		echo "Cancelado."; exit 1; \
 	fi
 	cd $(TF_DIR) && terraform destroy
+	@rm -f $(TF_DIR)/tfplan
+	@echo "$(YELLOW)Después de destroy: 'make tf-reinit ENV=$(ENV)' antes del próximo plan/apply.$(NC)"
 
 .PHONY: tf-output
-tf-output:  ## Mostrar todos los outputs (kubeconfig cmd, ARNs de IRSA, etc.)
+tf-output:  ## Mostrar todos los outputs de ENV=$(ENV) (kubeconfig cmd, ARNs de IRSA, etc.)
 	cd $(TF_DIR) && terraform output
+
+.PHONY: tf-state-list
+tf-state-list:  ## Listar recursos en el state de ENV=$(ENV) — útil para debug post-destroy
+	cd $(TF_DIR) && terraform state list
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Fase 2 — Acceso al cluster
@@ -136,26 +168,165 @@ ebs-mount-check:  ## Verificar que el EBS del nodo statefull esté montado (vía
 	  --parameters 'command="lsblk && echo --- && df -h /mnt/statefull && echo --- && ls -la /var/lib/elasticsearch /var/lib/prometheus"'
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Fase 3 — Addons (placeholder, se llena en la siguiente entrega)
+# Fase 3 — Repos Helm
+# ──────────────────────────────────────────────────────────────────────────────
+
+.PHONY: helm-repos
+helm-repos:  ## Agregar y actualizar todos los repos Helm necesarios (idempotente)
+	@echo "$(YELLOW)→ Agregando repos Helm...$(NC)"
+	helm repo add eks https://aws.github.io/eks-charts 2>/dev/null || true
+	helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx 2>/dev/null || true
+	helm repo add argo https://argoproj.github.io/argo-helm 2>/dev/null || true
+	helm repo add elastic https://helm.elastic.co 2>/dev/null || true
+	helm repo add fluent https://fluent.github.io/helm-charts 2>/dev/null || true
+	helm repo add prometheus-community https://prometheus-community.github.io/helm-charts 2>/dev/null || true
+	helm repo add headlamp https://headlamp-k8s.github.io/headlamp/ 2>/dev/null || true
+	helm repo add kubeshop https://kubeshop.github.io/helm-charts 2>/dev/null || true
+	helm repo update
+	@echo "$(GREEN)✓ Repos Helm actualizados$(NC)"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Fase 3 — Addons AWS (EKS)
 # ──────────────────────────────────────────────────────────────────────────────
 
 .PHONY: addons
-addons:  ## (Placeholder) Instalar todos los addons del cluster
-	@echo "$(YELLOW)Este target se completa en la Fase 3 del roadmap.$(NC)"
-	@echo "Va a instalar: ALB Controller, nginx, Karpenter, ArgoCD, ArgoRollouts,"
-	@echo "Tekton + Triggers, TestKube, EFK, Prometheus + Grafana, Headlamp."
+addons: helm-repos  ## Instalar todos los addons en el cluster EKS de ENV=$(ENV)
+	@echo "$(YELLOW)→ Leyendo outputs de Terraform para '$(ENV)'...$(NC)"
+	@CLUSTER_ENDPOINT=$$(cd $(TF_DIR) && terraform output -raw cluster_endpoint 2>/dev/null); \
+	ALB_ROLE=$$(cd $(TF_DIR) && terraform output -raw alb_controller_role_arn 2>/dev/null); \
+	KARPENTER_ROLE=$$(cd $(TF_DIR) && terraform output -raw karpenter_controller_role_arn 2>/dev/null); \
+	KARPENTER_NODE_ROLE=$$(cd $(TF_DIR) && terraform output -raw karpenter_node_role_name 2>/dev/null); \
+	KARPENTER_QUEUE=$$(cd $(TF_DIR) && terraform output -raw karpenter_interruption_queue 2>/dev/null); \
+	ACCOUNT_ID=$$(cd $(TF_DIR) && terraform output -raw account_id 2>/dev/null); \
+	CLUSTER_NAME=$$(cd $(TF_DIR) && terraform output -raw cluster_name 2>/dev/null); \
+	echo "$(YELLOW)→ 1/11 ALB Controller...$(NC)"; \
+	kubectl create namespace kube-system 2>/dev/null || true; \
+	helm upgrade --install aws-load-balancer-controller eks/aws-load-balancer-controller \
+	  --namespace kube-system \
+	  --values helm/addons/alb-controller/values.yaml \
+	  --set clusterName=$$CLUSTER_NAME \
+	  --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"=$$ALB_ROLE \
+	  --wait --timeout 2m; \
+	echo "$(YELLOW)→ 2/11 nginx-ingress...$(NC)"; \
+	kubectl create namespace ingress-nginx 2>/dev/null || true; \
+	helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx \
+	  --namespace ingress-nginx \
+	  --values helm/addons/nginx-ingress/values.yaml \
+	  --wait --timeout 2m; \
+	echo "$(YELLOW)→ 3/11 Karpenter...$(NC)"; \
+	kubectl create namespace karpenter 2>/dev/null || true; \
+	helm upgrade --install karpenter oci://public.ecr.aws/karpenter/karpenter \
+	  --namespace karpenter \
+	  --values helm/addons/karpenter/values.yaml \
+	  --set settings.aws.clusterName=$$CLUSTER_NAME \
+	  --set settings.aws.clusterEndpoint=$$CLUSTER_ENDPOINT \
+	  --set settings.aws.interruptionQueueName=$$KARPENTER_QUEUE \
+	  --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"=$$KARPENTER_ROLE \
+	  --wait --timeout 2m; \
+	echo "$(YELLOW)→ 4/11 metrics-server...$(NC)"; \
+	helm upgrade --install metrics-server eks/metrics-server \
+	  --namespace kube-system \
+	  --wait --timeout 2m; \
+	echo "$(YELLOW)→ 5/11 ArgoCD...$(NC)"; \
+	kubectl create namespace argocd 2>/dev/null || true; \
+	helm upgrade --install argocd argo/argo-cd \
+	  --namespace argocd \
+	  --values helm/addons/argocd/values.yaml \
+	  --wait --timeout 5m; \
+	echo "$(YELLOW)→ 6/11 Argo Rollouts...$(NC)"; \
+	kubectl create namespace argo-rollouts 2>/dev/null || true; \
+	helm upgrade --install argo-rollouts argo/argo-rollouts \
+	  --namespace argo-rollouts \
+	  --wait --timeout 2m; \
+	echo "$(YELLOW)→ 7/11 Tekton Pipelines + Triggers...$(NC)"; \
+	kubectl apply -f https://storage.googleapis.com/tekton-releases/pipeline/latest/release.yaml; \
+	kubectl apply -f https://storage.googleapis.com/tekton-releases/triggers/latest/release.yaml; \
+	kubectl apply -f https://storage.googleapis.com/tekton-releases/triggers/latest/interceptors.yaml; \
+	kubectl -n tekton-pipelines rollout status deployment/tekton-pipelines-controller --timeout=3m; \
+	echo "$(YELLOW)→ 8/11 Elasticsearch...$(NC)"; \
+	kubectl create namespace logging 2>/dev/null || true; \
+	helm upgrade --install elasticsearch elastic/elasticsearch \
+	  --namespace logging \
+	  --values helm/addons/elasticsearch/values.yaml \
+	  --wait --timeout 5m; \
+	echo "$(YELLOW)→ 9/11 Fluent Bit...$(NC)"; \
+	helm upgrade --install fluent-bit fluent/fluent-bit \
+	  --namespace logging \
+	  --values helm/addons/fluent-bit/values.yaml \
+	  --wait --timeout 2m; \
+	echo "$(YELLOW)→ 10/11 Kibana...$(NC)"; \
+	helm upgrade --install kibana elastic/kibana \
+	  --namespace logging \
+	  --values helm/addons/kibana/values.yaml \
+	  --wait --timeout 2m; \
+	echo "$(YELLOW)→ 11/11 kube-prometheus-stack...$(NC)"; \
+	kubectl create namespace monitoring 2>/dev/null || true; \
+	helm upgrade --install kube-prometheus prometheus-community/kube-prometheus-stack \
+	  --namespace monitoring \
+	  --values helm/addons/kube-prometheus/values.yaml \
+	  --wait --timeout 5m; \
+	echo "$(YELLOW)→ extras: Headlamp + Testkube...$(NC)"; \
+	kubectl create namespace testkube 2>/dev/null || true; \
+	helm upgrade --install headlamp headlamp/headlamp \
+	  --namespace kube-system \
+	  --values helm/addons/headlamp/values.yaml \
+	  --wait --timeout 2m; \
+	helm upgrade --install testkube kubeshop/testkube \
+	  --namespace testkube \
+	  --values helm/addons/testkube/values.yaml \
+	  --wait --timeout 5m; \
+	echo "$(GREEN)✓ Todos los addons instalados — ENV=$(ENV)$(NC)"; \
+	echo "$(YELLOW)Próximo: make addons-karpenter ENV=$(ENV) — después: make argocd-bootstrap$(NC)"
+
+.PHONY: addons-karpenter
+addons-karpenter:  ## Aplicar NodePool y EC2NodeClass post-addons (requiere Karpenter instalado)
+	@echo "$(YELLOW)→ Leyendo cluster name y node role desde Terraform...$(NC)"
+	@CLUSTER_NAME=$$(cd $(TF_DIR) && terraform output -raw cluster_name 2>/dev/null); \
+	KARPENTER_NODE_ROLE=$$(cd $(TF_DIR) && terraform output -raw karpenter_node_role_name 2>/dev/null); \
+	echo "$(YELLOW)→ Aplicando NodePool (stateless)...$(NC)"; \
+	sed -e "s/CLUSTER_NAME/$$CLUSTER_NAME/g" \
+	    -e "s/KARPENTER_NODE_ROLE/$$KARPENTER_NODE_ROLE/g" \
+	    manifests/karpenter/ec2-node-class.yaml | kubectl apply -f -; \
+	kubectl apply -f manifests/karpenter/node-pool.yaml; \
+	echo "$(GREEN)✓ Karpenter NodePool + EC2NodeClass aplicados$(NC)"
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Fase 8 — k3d local (placeholder)
+# Fase 4 — ArgoCD Bootstrap
 # ──────────────────────────────────────────────────────────────────────────────
 
-.PHONY: k3d-up
-k3d-up:  ## (Placeholder) Levantar el stack en k3d local
-	@echo "$(YELLOW)Este target se completa en la Fase 8 del roadmap.$(NC)"
+.PHONY: argocd-bootstrap
+argocd-bootstrap:  ## Aplicar el App-of-Apps raíz de ArgoCD (gitops-files)
+	@echo "$(YELLOW)→ Aplicando bootstrap de ArgoCD...$(NC)"
+	kubectl apply -f manifests/argocd/bootstrap.yaml
+	@echo "$(GREEN)✓ App-of-Apps aplicado. ArgoCD sincronizará desde github.com/Valentino-33/gitops-files$(NC)"
 
-.PHONY: k3d-down
-k3d-down:  ## (Placeholder) Bajar el cluster k3d
-	@echo "$(YELLOW)Este target se completa en la Fase 8 del roadmap.$(NC)"
+# ──────────────────────────────────────────────────────────────────────────────
+# Fase 5 — Tekton
+# ──────────────────────────────────────────────────────────────────────────────
+
+.PHONY: tekton-apply
+tekton-apply:  ## Aplicar todos los manifests de Tekton (pipelines, tasks, triggers)
+	@echo "$(YELLOW)→ Aplicando manifests/tekton/...$(NC)"
+	kubectl apply -f manifests/tekton/
+	@echo "$(GREEN)✓ Manifests de Tekton aplicados$(NC)"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Utilidades de acceso local
+# ──────────────────────────────────────────────────────────────────────────────
+
+.PHONY: port-forward
+port-forward:  ## Port-forward a ArgoCD:8080, Headlamp:8081, Grafana:8082, Kibana:8083 (background)
+	@echo "$(YELLOW)→ Iniciando port-forwards en background...$(NC)"
+	kubectl -n argocd port-forward svc/argocd-server 8080:80 > /tmp/pf-argocd.log 2>&1 &
+	@echo "  ArgoCD   → http://localhost:8080"
+	kubectl -n kube-system port-forward svc/headlamp 8081:80 > /tmp/pf-headlamp.log 2>&1 &
+	@echo "  Headlamp → http://localhost:8081"
+	kubectl -n monitoring port-forward svc/kube-prometheus-grafana 8082:80 > /tmp/pf-grafana.log 2>&1 &
+	@echo "  Grafana  → http://localhost:8082  (user: admin / pass: belo-challenge)"
+	kubectl -n logging port-forward svc/kibana-kibana 8083:5601 > /tmp/pf-kibana.log 2>&1 &
+	@echo "  Kibana   → http://localhost:8083"
+	@echo ""
+	@echo "$(GREEN)✓ Port-forwards activos. Para detenerlos: pkill -f 'kubectl.*port-forward'$(NC)"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Utilidades

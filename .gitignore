@@ -42,3 +42,6 @@ kubeconfig
 # Local
 .env
 .env.local
+
+# Claude Code memory
+.claude/

@@ -5,7 +5,7 @@ variable "region" {
 
 variable "cluster_name" {
   type    = string
-  default = "belo-challenge-dev"
+  default = "belo-challenge-production"
 }
 
 variable "kubernetes_version" {
@@ -14,7 +14,7 @@ variable "kubernetes_version" {
 
 variable "vpc_cidr" {
   type    = string
-  default = "10.0.0.0/16"
+  default = "10.4.0.0/16"
 }
 
 variable "azs" {
@@ -24,18 +24,18 @@ variable "azs" {
 
 variable "public_subnet_cidrs" {
   type    = list(string)
-  default = ["10.0.0.0/24", "10.0.1.0/24"]
+  default = ["10.4.0.0/24", "10.4.1.0/24"]
 }
 
 variable "private_subnet_cidrs" {
   type    = list(string)
-  default = ["10.0.16.0/20", "10.0.32.0/20"]
+  default = ["10.4.16.0/20", "10.4.32.0/20"]
 }
 
 variable "endpoint_public_access_cidrs" {
-  description = "CIDRs autorizados a hablar con la API de EKS. Restringir en producción real."
+  description = "OBLIGATORIO en producción: restringir a IPs conocidas (VPN, oficina). Nunca 0.0.0.0/0."
   type        = list(string)
-  default     = ["0.0.0.0/0"]
+  default     = ["0.0.0.0/0"]   # cambiar en terraform.tfvars antes de aplicar en producción real
 }
 
 variable "ami_id" {

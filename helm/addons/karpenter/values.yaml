@@ -1,0 +1,10 @@
+# Los valores dinámicos se pasan con --set en el Makefile
+controller:
+  resources:
+    requests:
+      cpu: 100m
+      memory: 512Mi
+    limits:
+      memory: 512Mi
+nodeSelector:
+  role: stateless

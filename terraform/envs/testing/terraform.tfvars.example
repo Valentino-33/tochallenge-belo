@@ -1,0 +1,15 @@
+# Ambiente: testing
+# Propósito: CI de features, validación de pipelines, smoke tests de extremo a extremo.
+# Diferencias respecto a dev: mismo tamaño pero cluster separado e independiente.
+# Se levanta y destruye frecuentemente — no se guarda estado crítico acá.
+
+region             = "us-east-1"
+cluster_name       = "belo-challenge-testing"
+kubernetes_version = "1.35"
+dockerhub_user     = "valentinobruno"
+
+# ubuntu-eks/k8s_1.35/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-20260429
+ami_id = "ami-0bbcc28a769c6008a"
+
+# Acceso a la API de EKS — por defecto abierto, restringir en envs productivos.
+# endpoint_public_access_cidrs = ["0.0.0.0/0"]

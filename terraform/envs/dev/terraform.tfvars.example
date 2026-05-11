@@ -4,7 +4,7 @@
 
 region             = "us-east-1"
 cluster_name       = "belo-challenge-dev"
-kubernetes_version = "1.33"
+kubernetes_version = "1.35"
 
 # Si querés restringir el acceso a la API del cluster, dejar tu IP /32 acá.
 # Ejemplo: ["190.x.x.x/32"]
@@ -16,3 +16,12 @@ kubernetes_version = "1.33"
 # ssh_key_name = "tu-key"
 
 dockerhub_user = "valentinobruno"
+
+# AMI fija para los nodos Ubuntu 24.04 EKS 1.35 (Canonical owner: 099720109477).
+# Obtener el ID más reciente con:
+#   aws ec2 describe-images --owners 099720109477 \
+#     --filters "Name=name,Values=ubuntu-eks/k8s_1.35/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*" \
+#               "Name=state,Values=available" \
+#     --query "sort_by(Images, &CreationDate)[-1].ImageId" \
+#     --output text --region us-east-1
+ami_id = "ami-0bbcc28a769c6008a" # ubuntu-noble-24.04-amd64-server-20260429

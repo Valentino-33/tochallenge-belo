@@ -1,0 +1,9 @@
+# Este archivo NO se commitea con valores reales.
+# Copiarlo como backend.hcl y editar.
+# El bucket tiene que ser el mismo que se creó con `make tf-bootstrap`.
+
+bucket         = "belo-challenge-tfstate-PEGAR-ALGO-UNICO"
+key            = "envs/testing/terraform.tfstate"
+region         = "us-east-1"
+dynamodb_table = "belo-challenge-tflock"
+encrypt        = true

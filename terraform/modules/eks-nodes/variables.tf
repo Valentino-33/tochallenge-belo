@@ -51,22 +51,34 @@ variable "statefull_instance_types" {
 
 variable "stateless_desired_size" {
   type    = number
-  default = 2
+  default = 1
 }
 
 variable "stateless_min_size" {
   type    = number
-  default = 2
+  default = 1
 }
 
 variable "stateless_max_size" {
   type    = number
-  default = 4
+  default = 4   # Karpenter puede escalar hasta acá si hay pods Pending
+}
+
+variable "cicd_instance_types" {
+  description = "Instance type para el nodo dedicado a Tekton. t3.medium alcanza para builds con Kaniko y PVCs de 1 GiB."
+  type        = list(string)
+  default     = ["t3.medium"]
 }
 
 variable "statefull_ebs_size_gb" {
   type    = number
   default = 20
+}
+
+variable "ami_id" {
+  description = "AMI ID fija para los nodos Ubuntu 24.04 EKS. Si es null, se resuelve dinámicamente desde SSM (no recomendado — puede cambiar entre plans)."
+  type        = string
+  default     = null
 }
 
 variable "ssh_key_name" {

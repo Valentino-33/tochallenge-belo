@@ -1,0 +1,4 @@
+# Los valores dinámicos (clusterName, role ARN) se pasan con --set en el Makefile
+replicaCount: 1
+nodeSelector:
+  role: stateless

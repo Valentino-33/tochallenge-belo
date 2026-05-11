@@ -3,7 +3,7 @@ data "aws_caller_identity" "current" {}
 locals {
   common_tags = {
     project     = "tochallenge-belo"
-    environment = "dev"
+    environment = "production"
     managed_by  = "terraform"
     cluster     = var.cluster_name
     owner       = var.dockerhub_user

@@ -1,0 +1,14 @@
+# Ambiente: lab
+# Propósito: investigación, prueba de nuevas features de infra, spike de addons.
+# Se permite romper cosas acá. Cluster efímero, no hay datos persistentes que importen.
+
+region             = "us-east-1"
+cluster_name       = "belo-challenge-lab"
+kubernetes_version = "1.35"
+dockerhub_user     = "valentinobruno"
+
+# ubuntu-eks/k8s_1.35/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-20260429
+ami_id = "ami-0bbcc28a769c6008a"
+
+# Acceso a la API de EKS — por defecto abierto.
+# endpoint_public_access_cidrs = ["0.0.0.0/0"]

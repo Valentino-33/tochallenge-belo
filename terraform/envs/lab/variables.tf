@@ -5,7 +5,7 @@ variable "region" {
 
 variable "cluster_name" {
   type    = string
-  default = "belo-challenge-dev"
+  default = "belo-challenge-lab"
 }
 
 variable "kubernetes_version" {
@@ -14,7 +14,7 @@ variable "kubernetes_version" {
 
 variable "vpc_cidr" {
   type    = string
-  default = "10.0.0.0/16"
+  default = "10.2.0.0/16"
 }
 
 variable "azs" {
@@ -24,12 +24,12 @@ variable "azs" {
 
 variable "public_subnet_cidrs" {
   type    = list(string)
-  default = ["10.0.0.0/24", "10.0.1.0/24"]
+  default = ["10.2.0.0/24", "10.2.1.0/24"]
 }
 
 variable "private_subnet_cidrs" {
   type    = list(string)
-  default = ["10.0.16.0/20", "10.0.32.0/20"]
+  default = ["10.2.16.0/20", "10.2.32.0/20"]
 }
 
 variable "endpoint_public_access_cidrs" {

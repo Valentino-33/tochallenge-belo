@@ -1,0 +1,17 @@
+# Ambiente: staging
+# Propósito: validación pre-producción. Configuración idéntica a producción,
+# datos sintéticos. Los cambios de infra se prueban acá antes de tocar production.
+
+region             = "us-east-1"
+cluster_name       = "belo-challenge-staging"
+kubernetes_version = "1.35"
+dockerhub_user     = "valentinobruno"
+
+# ubuntu-eks/k8s_1.35/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-20260429
+ami_id = "ami-0bbcc28a769c6008a"
+
+# En staging restringir el acceso a la API al rango de la empresa/VPN.
+# endpoint_public_access_cidrs = ["TU_IP/32"]
+
+# Staging debería ser idéntico a production en instance types.
+# Si los módulos exponen variables para eso, sobreescribirlas acá.

@@ -5,8 +5,7 @@ Stack completo para correr dos APIs en Kubernetes con estrategias de deployment
 observabilidad con EFK y Prometheus/Grafana, y autenticación contra IAM.
 
 Este repo concentra la infraestructura como código (Terraform), los manifiestos
-de cluster, la documentación y la versión paralela en **k3d** para correr todo
-local sin gastar AWS.
+de cluster y la documentación.
 
 ## Mapa de repos
 
@@ -20,7 +19,7 @@ local sin gastar AWS.
 
 ## Documentación
 
-- **[ROADMAP.md](./ROADMAP.md)** — guía paso a paso del despliegue completo (AWS + k3d).
+- **[ROADMAP.md](./ROADMAP.md)** — guía paso a paso del despliegue completo en AWS.
 - **[COSTS.md](./COSTS.md)** — desglose de costos en AWS, fuentes de precios y tácticas para bajar la factura.
 - **[docs/architecture.md](./docs/architecture.md)** — diagramas de la infra, del cluster y del pipeline CI/CD.
 - **[docs/dns-tls-future.md](./docs/dns-tls-future.md)** — integración futura de Route53 / Cloudflare y certificados ACM.
@@ -34,7 +33,6 @@ local sin gastar AWS.
 | kubectl     | 1.30           | Misma minor que el cluster EKS |
 | Helm        | 3.14+          | Instalar addons |
 | eksctl      | 0.180+         | Solo para asociar OIDC provider rápido |
-| k3d         | 5.6+           | Cluster local de la versión alternativa |
 | Docker      | 24+            | Build de imágenes en local |
 | jq, yq      | recientes      | Procesar JSON/YAML en scripts |
 
@@ -49,13 +47,6 @@ make tf-apply         # crear la infra (toma ~15-20 min por EKS)
 make kubeconfig       # bajar kubeconfig al ~/.kube/config
 make addons           # instalar ALB Controller, nginx, ArgoCD, Tekton...
 make tf-destroy       # bajar TODO (importante para no acumular costos)
-```
-
-### En local con k3d
-
-```bash
-make k3d-up           # cluster local + addons + ArgoCD listo
-make k3d-down         # destruir todo
 ```
 
 Para entender qué hace cada uno de esos targets internamente, leer el
