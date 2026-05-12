@@ -1,11 +1,14 @@
 # EC2NodeClass para Ubuntu 24.04 en subnets privadas del cluster.
 # CLUSTER_NAME y KARPENTER_NODE_ROLE se sustituyen con sed en el Makefile.
-apiVersion: karpenter.k8s.aws/v1beta1
+apiVersion: karpenter.k8s.aws/v1
 kind: EC2NodeClass
 metadata:
   name: default
 spec:
-  amiFamily: Ubuntu
+  amiFamily: Custom
+  amiSelectorTerms:
+    - name: "ubuntu-eks/k8s_1.35/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*"
+      owner: "099720109477"
   instanceProfile: KARPENTER_NODE_ROLE
   subnetSelectorTerms:
     - tags:

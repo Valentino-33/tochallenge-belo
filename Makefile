@@ -121,8 +121,94 @@ tf-apply:  ## Aplicar la infra de ENV=$(ENV) — toma 15-20 min por EKS
 	@echo "$(GREEN)✓ Infra desplegada — ambiente: $(ENV)$(NC)"
 	@echo "$(YELLOW)Próximo: make kubeconfig ENV=$(ENV) — después: make addons ENV=$(ENV)$(NC)"
 
+.PHONY: pre-destroy
+pre-destroy:  ## Limpiar recursos AWS creados por K8s antes del destroy (LBs, ENIs) — evita DependencyViolation
+	@echo "$(YELLOW)→ Limpieza pre-destroy: borrando LoadBalancers creados por Kubernetes...$(NC)"
+	@VPC_ID=$$(cd $(TF_DIR) && terraform output -raw vpc_id 2>/dev/null || echo ""); \
+	if [ -z "$$VPC_ID" ]; then \
+		echo "$(YELLOW)  No se pudo obtener vpc_id del state — saltando limpieza automática$(NC)"; \
+		echo "$(YELLOW)  Si el destroy falla, corré: make cleanup-vpc-deps VPC_ID=<id>$(NC)"; \
+	else \
+		echo "$(YELLOW)  VPC: $$VPC_ID$(NC)"; \
+		echo "$(YELLOW)  1/4 Borrando ALBs/NLBs en la VPC...$(NC)"; \
+		for arn in $$(aws elbv2 describe-load-balancers --region $(REGION) \
+		  --query "LoadBalancers[?VpcId=='$$VPC_ID'].LoadBalancerArn" --output text 2>/dev/null); do \
+			echo "    Borrando ELBv2: $$arn"; \
+			aws elbv2 delete-load-balancer --region $(REGION) --load-balancer-arn $$arn; \
+		done; \
+		echo "$(YELLOW)  2/4 Borrando Classic ELBs en la VPC...$(NC)"; \
+		for name in $$(aws elb describe-load-balancers --region $(REGION) \
+		  --query "LoadBalancerDescriptions[?VPCId=='$$VPC_ID'].LoadBalancerName" --output text 2>/dev/null); do \
+			echo "    Borrando ELB classic: $$name"; \
+			aws elb delete-load-balancer --region $(REGION) --load-balancer-name $$name; \
+		done; \
+		echo "$(YELLOW)  Esperando 20s...$(NC)"; sleep 20; \
+		echo "$(YELLOW)  3/4 Borrando NAT Gateways y liberando EIPs...$(NC)"; \
+		for ngw in $$(aws ec2 describe-nat-gateways --region $(REGION) \
+		  --filter "Name=vpc-id,Values=$$VPC_ID" "Name=state,Values=available,pending" \
+		  --query 'NatGateways[*].NatGatewayId' --output text 2>/dev/null); do \
+			echo "    Borrando NAT Gateway: $$ngw"; \
+			aws ec2 delete-nat-gateway --region $(REGION) --nat-gateway-id $$ngw; \
+		done; \
+		echo "$(YELLOW)  Esperando 30s para que los NAT GWs terminen...$(NC)"; sleep 30; \
+		for eip in $$(aws ec2 describe-addresses --region $(REGION) \
+		  --filters "Name=domain,Values=vpc" \
+		  --query 'Addresses[?AssociationId==null].AllocationId' --output text 2>/dev/null); do \
+			echo "    Liberando EIP: $$eip"; \
+			aws ec2 release-address --region $(REGION) --allocation-id $$eip 2>/dev/null || true; \
+		done; \
+		echo "$(YELLOW)  4/4 Borrando ENIs huérfanas (status=available)...$(NC)"; \
+		for eni in $$(aws ec2 describe-network-interfaces --region $(REGION) \
+		  --filters "Name=vpc-id,Values=$$VPC_ID" "Name=status,Values=available" \
+		  --query 'NetworkInterfaces[*].NetworkInterfaceId' --output text 2>/dev/null); do \
+			echo "    Borrando ENI: $$eni"; \
+			aws ec2 delete-network-interface --region $(REGION) --network-interface-id $$eni; \
+		done; \
+		echo "$(GREEN)✓ Limpieza pre-destroy OK$(NC)"; \
+	fi
+
+.PHONY: cleanup-vpc-deps
+cleanup-vpc-deps:  ## Limpiar deps de una VPC específica: make cleanup-vpc-deps VPC_ID=vpc-xxxx
+	@if [ -z "$(VPC_ID)" ]; then echo "$(RED)Falta VPC_ID. Uso: make cleanup-vpc-deps VPC_ID=vpc-xxxx$(NC)"; exit 1; fi
+	@echo "$(YELLOW)→ Limpiando dependencias de VPC $(VPC_ID)...$(NC)"
+	@echo "$(YELLOW)  1/4 Borrando ALBs/NLBs...$(NC)"
+	@for arn in $$(aws elbv2 describe-load-balancers --region $(REGION) \
+	  --query "LoadBalancers[?VpcId=='$(VPC_ID)'].LoadBalancerArn" --output text 2>/dev/null); do \
+		echo "    Borrando ELBv2: $$arn"; \
+		aws elbv2 delete-load-balancer --region $(REGION) --load-balancer-arn $$arn; \
+	done
+	@echo "$(YELLOW)  2/4 Borrando Classic ELBs...$(NC)"
+	@for name in $$(aws elb describe-load-balancers --region $(REGION) \
+	  --query "LoadBalancerDescriptions[?VPCId=='$(VPC_ID)'].LoadBalancerName" --output text 2>/dev/null); do \
+		echo "    Borrando ELB classic: $$name"; \
+		aws elb delete-load-balancer --region $(REGION) --load-balancer-name $$name; \
+	done
+	@echo "$(YELLOW)  Esperando 20s para que AWS libere recursos de LBs...$(NC)"; sleep 20
+	@echo "$(YELLOW)  3/4 Borrando NAT Gateways y liberando sus EIPs...$(NC)"
+	@for ngw in $$(aws ec2 describe-nat-gateways --region $(REGION) \
+	  --filter "Name=vpc-id,Values=$(VPC_ID)" "Name=state,Values=available,pending" \
+	  --query 'NatGateways[*].NatGatewayId' --output text 2>/dev/null); do \
+		echo "    Borrando NAT Gateway: $$ngw"; \
+		aws ec2 delete-nat-gateway --region $(REGION) --nat-gateway-id $$ngw; \
+	done; \
+	echo "$(YELLOW)  Esperando 30s para que los NAT GWs terminen de borrarse...$(NC)"; sleep 30; \
+	for eip in $$(aws ec2 describe-addresses --region $(REGION) \
+	  --filters "Name=domain,Values=vpc" \
+	  --query 'Addresses[?AssociationId==null].AllocationId' --output text 2>/dev/null); do \
+		echo "    Liberando EIP: $$eip"; \
+		aws ec2 release-address --region $(REGION) --allocation-id $$eip 2>/dev/null || true; \
+	done
+	@echo "$(YELLOW)  4/4 Borrando ENIs huérfanas (status=available)...$(NC)"
+	@for eni in $$(aws ec2 describe-network-interfaces --region $(REGION) \
+	  --filters "Name=vpc-id,Values=$(VPC_ID)" "Name=status,Values=available" \
+	  --query 'NetworkInterfaces[*].NetworkInterfaceId' --output text 2>/dev/null); do \
+		echo "    Borrando ENI: $$eni"; \
+		aws ec2 delete-network-interface --region $(REGION) --network-interface-id $$eni; \
+	done
+	@echo "$(GREEN)✓ VPC $(VPC_ID) limpia — podés reintentar make tf-destroy$(NC)"
+
 .PHONY: tf-destroy
-tf-destroy:  ## Destruir TODA la infra de ENV=$(ENV) — IRREVERSIBLE
+tf-destroy: pre-destroy  ## Destruir TODA la infra de ENV=$(ENV) — IRREVERSIBLE
 	@echo "$(RED)⚠  Esto va a destruir toda la infra de '$(ENV)'.$(NC)"
 	@echo "$(RED)   El bucket de tfstate NO se destruye (contiene el state de todos los envs).$(NC)"
 	@read -p "Escribí '$(ENV)' para confirmar: " confirm; \
@@ -180,7 +266,7 @@ helm-repos:  ## Agregar y actualizar todos los repos Helm necesarios (idempotent
 	helm repo add elastic https://helm.elastic.co 2>/dev/null || true
 	helm repo add fluent https://fluent.github.io/helm-charts 2>/dev/null || true
 	helm repo add prometheus-community https://prometheus-community.github.io/helm-charts 2>/dev/null || true
-	helm repo add headlamp https://headlamp-k8s.github.io/headlamp/ 2>/dev/null || true
+	helm repo add metrics-server https://kubernetes-sigs.github.io/metrics-server/ 2>/dev/null || true
 	helm repo add kubeshop https://kubeshop.github.io/helm-charts 2>/dev/null || true
 	helm repo update
 	@echo "$(GREEN)✓ Repos Helm actualizados$(NC)"
@@ -199,83 +285,114 @@ addons: helm-repos  ## Instalar todos los addons en el cluster EKS de ENV=$(ENV)
 	KARPENTER_QUEUE=$$(cd $(TF_DIR) && terraform output -raw karpenter_interruption_queue 2>/dev/null); \
 	ACCOUNT_ID=$$(cd $(TF_DIR) && terraform output -raw account_id 2>/dev/null); \
 	CLUSTER_NAME=$$(cd $(TF_DIR) && terraform output -raw cluster_name 2>/dev/null); \
-	echo "$(YELLOW)→ 1/11 ALB Controller...$(NC)"; \
+	helm_retry() { \
+	  local label="$$1"; shift; \
+	  local n=1; \
+	  echo "$(YELLOW)→ $$label$(NC)"; \
+	  while [ $$n -le 3 ]; do \
+	    if "$$@"; then \
+	      echo "$(GREEN)✓ $$label OK$(NC)"; \
+	      return 0; \
+	    fi; \
+	    echo "$(RED)  intento $$n/3 falló$(NC)"; \
+	    n=$$((n+1)); \
+	    if [ $$n -le 3 ]; then \
+	      echo "$(YELLOW)  reintentando en 30s...$(NC)"; \
+	      sleep 30; \
+	    fi; \
+	  done; \
+	  echo "$(RED)✗ $$label — falló tras 3 intentos$(NC)"; \
+	  return 1; \
+	}; \
+	kubectl_retry() { \
+	  local label="$$1" ns="$$2" deploy="$$3" timeout="$$4"; \
+	  local n=1; \
+	  echo "$(YELLOW)→ Esperando rollout: $$label$(NC)"; \
+	  while [ $$n -le 3 ]; do \
+	    if kubectl -n "$$ns" rollout status deployment/"$$deploy" --timeout="$$timeout"; then \
+	      echo "$(GREEN)✓ $$label ready$(NC)"; \
+	      return 0; \
+	    fi; \
+	    n=$$((n+1)); \
+	    if [ $$n -le 3 ]; then \
+	      echo "$(YELLOW)  reintentando en 30s...$(NC)"; \
+	      sleep 30; \
+	    fi; \
+	  done; \
+	  echo "$(RED)✗ $$label — rollout timeout tras 3 intentos$(NC)"; \
+	  return 1; \
+	}; \
 	kubectl create namespace kube-system 2>/dev/null || true; \
-	helm upgrade --install aws-load-balancer-controller eks/aws-load-balancer-controller \
+	helm_retry "1/11 ALB Controller" helm upgrade --install aws-load-balancer-controller eks/aws-load-balancer-controller \
 	  --namespace kube-system \
 	  --values helm/addons/alb-controller/values.yaml \
 	  --set clusterName=$$CLUSTER_NAME \
 	  --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"=$$ALB_ROLE \
-	  --wait --timeout 2m; \
-	echo "$(YELLOW)→ 2/11 nginx-ingress...$(NC)"; \
+	  --atomic --timeout 3m; \
 	kubectl create namespace ingress-nginx 2>/dev/null || true; \
-	helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx \
+	helm_retry "2/11 nginx-ingress" helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx \
 	  --namespace ingress-nginx \
 	  --values helm/addons/nginx-ingress/values.yaml \
-	  --wait --timeout 2m; \
-	echo "$(YELLOW)→ 3/11 Karpenter...$(NC)"; \
+	  --atomic --timeout 3m; \
 	kubectl create namespace karpenter 2>/dev/null || true; \
-	helm upgrade --install karpenter oci://public.ecr.aws/karpenter/karpenter \
+	helm_retry "3/11 Karpenter" helm upgrade --install karpenter oci://public.ecr.aws/karpenter/karpenter \
 	  --namespace karpenter \
 	  --values helm/addons/karpenter/values.yaml \
-	  --set settings.aws.clusterName=$$CLUSTER_NAME \
-	  --set settings.aws.clusterEndpoint=$$CLUSTER_ENDPOINT \
-	  --set settings.aws.interruptionQueueName=$$KARPENTER_QUEUE \
+	  --set settings.clusterName=$$CLUSTER_NAME \
+	  --set settings.clusterEndpoint=$$CLUSTER_ENDPOINT \
+	  --set settings.interruptionQueue=$$KARPENTER_QUEUE \
 	  --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"=$$KARPENTER_ROLE \
-	  --wait --timeout 2m; \
-	echo "$(YELLOW)→ 4/11 metrics-server...$(NC)"; \
-	helm upgrade --install metrics-server eks/metrics-server \
+	  --atomic --timeout 3m; \
+	helm_retry "4/11 metrics-server" helm upgrade --install metrics-server metrics-server/metrics-server \
 	  --namespace kube-system \
-	  --wait --timeout 2m; \
-	echo "$(YELLOW)→ 5/11 ArgoCD...$(NC)"; \
+	  --atomic --timeout 3m; \
 	kubectl create namespace argocd 2>/dev/null || true; \
-	helm upgrade --install argocd argo/argo-cd \
+	helm_retry "5/11 ArgoCD" helm upgrade --install argocd argo/argo-cd \
 	  --namespace argocd \
 	  --values helm/addons/argocd/values.yaml \
-	  --wait --timeout 5m; \
-	echo "$(YELLOW)→ 6/11 Argo Rollouts...$(NC)"; \
+	  --atomic --timeout 8m; \
 	kubectl create namespace argo-rollouts 2>/dev/null || true; \
-	helm upgrade --install argo-rollouts argo/argo-rollouts \
+	helm_retry "6/11 Argo Rollouts" helm upgrade --install argo-rollouts argo/argo-rollouts \
 	  --namespace argo-rollouts \
-	  --wait --timeout 2m; \
+	  --set replicaCount=1 \
+	  --atomic --timeout 5m; \
 	echo "$(YELLOW)→ 7/11 Tekton Pipelines + Triggers...$(NC)"; \
 	kubectl apply -f https://storage.googleapis.com/tekton-releases/pipeline/latest/release.yaml; \
 	kubectl apply -f https://storage.googleapis.com/tekton-releases/triggers/latest/release.yaml; \
 	kubectl apply -f https://storage.googleapis.com/tekton-releases/triggers/latest/interceptors.yaml; \
-	kubectl -n tekton-pipelines rollout status deployment/tekton-pipelines-controller --timeout=3m; \
-	echo "$(YELLOW)→ 8/11 Elasticsearch...$(NC)"; \
+	kubectl_retry "tekton-pipelines-controller" tekton-pipelines tekton-pipelines-controller 5m; \
 	kubectl create namespace logging 2>/dev/null || true; \
-	helm upgrade --install elasticsearch elastic/elasticsearch \
+	helm_retry "8/11 Elasticsearch" helm upgrade --install elasticsearch elastic/elasticsearch \
 	  --namespace logging \
 	  --values helm/addons/elasticsearch/values.yaml \
-	  --wait --timeout 5m; \
-	echo "$(YELLOW)→ 9/11 Fluent Bit...$(NC)"; \
-	helm upgrade --install fluent-bit fluent/fluent-bit \
+	  --atomic --timeout 10m; \
+	helm_retry "9/11 Fluent Bit" helm upgrade --install fluent-bit fluent/fluent-bit \
 	  --namespace logging \
 	  --values helm/addons/fluent-bit/values.yaml \
-	  --wait --timeout 2m; \
-	echo "$(YELLOW)→ 10/11 Kibana...$(NC)"; \
-	helm upgrade --install kibana elastic/kibana \
+	  --atomic --timeout 3m; \
+	helm_retry "10/11 Kibana" helm upgrade --install kibana elastic/kibana \
 	  --namespace logging \
 	  --values helm/addons/kibana/values.yaml \
-	  --wait --timeout 2m; \
-	echo "$(YELLOW)→ 11/11 kube-prometheus-stack...$(NC)"; \
+	  --atomic --timeout 5m; \
 	kubectl create namespace monitoring 2>/dev/null || true; \
-	helm upgrade --install kube-prometheus prometheus-community/kube-prometheus-stack \
+	helm_retry "11/11 kube-prometheus-stack" helm upgrade --install kube-prometheus prometheus-community/kube-prometheus-stack \
 	  --namespace monitoring \
 	  --values helm/addons/kube-prometheus/values.yaml \
-	  --wait --timeout 5m; \
+	  --atomic --timeout 10m; \
 	echo "$(YELLOW)→ extras: Headlamp + Testkube...$(NC)"; \
 	kubectl create namespace testkube 2>/dev/null || true; \
-	helm upgrade --install headlamp headlamp/headlamp \
+	helm_retry "extras: Headlamp" helm upgrade --install headlamp oci://ghcr.io/headlamp-k8s/charts/headlamp \
 	  --namespace kube-system \
 	  --values helm/addons/headlamp/values.yaml \
-	  --wait --timeout 2m; \
-	helm upgrade --install testkube kubeshop/testkube \
+	  --atomic --timeout 3m \
+	  || echo "$(YELLOW)  WARN: Headlamp falló (addon opcional, continúa)$(NC)"; \
+	helm_retry "extras: Testkube" helm upgrade --install testkube kubeshop/testkube \
 	  --namespace testkube \
 	  --values helm/addons/testkube/values.yaml \
-	  --wait --timeout 5m; \
-	echo "$(GREEN)✓ Todos los addons instalados — ENV=$(ENV)$(NC)"; \
+	  --atomic --timeout 10m \
+	  || echo "$(YELLOW)  WARN: Testkube falló — verificar StorageClass gp3 y EBS CSI Driver$(NC)"; \
+	echo "$(GREEN)✓ Addons instalados — ENV=$(ENV)$(NC)"; \
+	echo "$(YELLOW)Re-ejecutar 'make addons ENV=$(ENV)' para reintentar fallidos (es idempotente).$(NC)"; \
 	echo "$(YELLOW)Próximo: make addons-karpenter ENV=$(ENV) — después: make argocd-bootstrap$(NC)"
 
 .PHONY: addons-karpenter

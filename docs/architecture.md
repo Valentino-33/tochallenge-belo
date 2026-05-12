@@ -122,9 +122,9 @@ flowchart LR
         TKB[TestKube]
     end
 
-    subgraph ns_apps["namespace: apps"]
-        A1[webserver-api01<br/>Rollout BlueGreen]
-        A2[webserver-api02<br/>Rollout Canary]
+    subgraph ns_apps["namespace: dev | staging | prod | testing | lab"]
+        A1[webserver-api01<br/>Rollout — strategy desde values]
+        A2[webserver-api02<br/>Rollout — strategy desde values]
     end
 
     subgraph ns_log["namespace: logging<br/>(pinned to statefulls node)"]
@@ -195,83 +195,83 @@ sequenceDiagram
     autonumber
     actor Dev
     participant GH as GitHub<br/>(repo de la app)
-    participant EL as Tekton<br/>EventListener
+    participant EL as Tekton<br/>EventListener (CEL)
     participant TR as Tekton<br/>PipelineRun
     participant DH as Docker Hub
-    participant GO as gitops-files<br/>(GitHub)
+    participant HC as belo-helm-charts<br/>(GitHub)
     participant AC as ArgoCD
     participant AR as ArgoRollouts
-    participant K6 as TestKube + k6
+    participant K6 as k6 (in-cluster)
     participant USR as Usuarios
 
-    Dev->>GH: git tag -a deploy:production -m "strategy:BlueGreen" v1.4.0
-    GH->>EL: webhook (push tag annotated)
-    EL->>EL: Interceptor parsea tag<br/>extrae environment + strategy
+    Dev->>GH: git tag prod/bluegreen/v1.4.0
+    GH->>EL: webhook (push tag)
+    EL->>EL: CEL extrae env=prod<br/>strategy=bluegreen  image_tag=v1.4.0
     EL->>TR: crea PipelineRun con params
-    TR->>GH: clone repo
-    TR->>TR: Kaniko build + push
-    TR->>DH: image:v1.4.0
-    TR->>GO: commit "bump api01 to v1.4.0"
-    GO->>AC: webhook (commit a gitops-files)
-    AC->>AR: aplica nueva spec del Rollout
-    AR->>AR: deploy versión "GREEN" / "Canary"
-    AR->>K6: spawn TestKube test
-    K6->>AR: pass/fail (HTTP 200 ratio, p95, p99, vusers)
-
-    alt Tests OK
-        AR->>AR: switch traffic 100%<br/>(BlueGreen) o aumentar peso (Canary)
-        AR-->>USR: nueva versión activa
-        AR-->>TR: status: succeeded
-    else Tests fallan
-        AR->>AR: rollback automático<br/>destruye GREEN / vuelve a 0% canary
-        AR-->>TR: status: failed
-        TR-->>Dev: notification (Slack opcional)
+    Note over TR: Stage 1 — clone
+    TR->>GH: git clone --depth 1
+    Note over TR: Stage 2 — build-push
+    TR->>TR: Kaniko build
+    TR->>DH: push image:v1.4.0
+    Note over TR: Stage 3 — bump-gitops
+    TR->>HC: yq: image.tag=v1.4.0  rollout.strategy=bluegreen
+    TR->>HC: git commit + push
+    Note over TR: Stage 4 — wait-argocd
+    HC->>AC: detección de cambio (polling o webhook)
+    AC->>AR: aplica Rollout actualizado
+    AR->>AR: despliega green pods (preview service)
+    TR->>TR: polling: ArgoCD Synced+Healthy<br/>Rollout fase=Paused
+    Note over TR: Stage 5 — load-test
+    TR->>K6: k6 run load-bluegreen.js → preview svc
+    K6-->>TR: result outcome=passed|failed
+    Note over TR: Stage 6 — promote-rollback
+    alt outcome = passed
+        TR->>AR: argo rollouts promote
+        AR->>USR: switch tráfico → nueva versión (stable)
+    else outcome = failed
+        TR->>AR: argo rollouts abort
+        AR->>AR: destruye green, stable intacto
     end
 ```
 
-### Detalle del Pipeline Tekton
+> El diagrama muestra el caso BlueGreen. Para Canary, el Stage 6 hace tres
+> promote intermedios (25% → k6 → 50% → k6 → 100%), abortando en cualquier
+> fallo. Para RollingUpdate, el deploy está completo al llegar al Stage 5 y
+> el Stage 6 solo hace undo si k6 falla.
 
-Stages, en orden:
+### Stages del Pipeline (implementados en `belo-helm-charts/charts-core/pythonapps/templates/pipeline-templates/`)
 
-1. **clone-repo** — `git-clone` task estándar de Tekton Catalog.
-2. **build-image** — Kaniko, sin Docker daemon, monta workspace de 1 GiB
-   efímero. Args: `--destination=docker.io/<user>/<app>:<version>`.
-3. **push-to-dockerhub** — implícito en Kaniko, pero hay un task
-   separado de `cosign sign` para firmar la imagen (opcional, si
-   activamos supply-chain).
-4. **bump-helm-values** — task custom que abre un PR (o commit directo)
-   al repo `gitops-files`, branch correspondiente al ambiente, modificando
-   el `values.yaml` con el nuevo tag.
-5. **wait-for-argocd-sync** — espera que ArgoCD reporte `Synced + Healthy`
-   (timeout 5 min).
-6. **load-test** — `testkube run k6 <script>`, donde el script se elige
-   según `strategy`:
-   - `bluegreen` → `loadtest/load-bluegreen.js` apuntado al `preview` Service.
-   - `canary` → `loadtest/load-canary.js` apuntado al Service principal,
-     ejecutado **después de cada step de promoción** del Rollout.
-   - `rollingupdate` → `loadtest/smoke.js` al final.
-7. **promote-or-rollback** — corre `kubectl argo rollouts promote` o `abort`
-   según el resultado del step anterior.
-
-### Cómo se interpreta el tag annotated
-
-El interceptor de Tekton lee el cuerpo del tag y mapea a params:
-
-| Tag annotated body | environment | strategy |
+| # | Task Tekton | Qué hace |
 |---|---|---|
-| `strategy:BlueGreen` | production | BlueGreen |
-| `strategy:Canary` | production | Canary |
-| (vacío o sin `strategy:`) | inferido del prefijo del tag | RollingUpdate |
-| `strategy:RollingUpdate` | production | RollingUpdate |
+| 1 | `git-clone-app` | `git clone --depth 1` del repo de la app al workspace `source` |
+| 2 | `kaniko-build-push` | Build desde `src/Dockerfile` + push a Docker Hub (cache 24h) |
+| 3 | `bump-gitops-image` | `yq`: actualiza `image.tag` y `rollout.strategy` en el values del ambiente; commit + push a `belo-helm-charts` |
+| 4 | `wait-argocd-sync` | Polling hasta ArgoCD `Synced+Healthy` y Rollout en fase `Paused` (BG/Canary) o `Healthy` (Rolling) |
+| 5 | `run-load-test` | k6 contra el endpoint correcto según strategy; emite Tekton result `outcome=passed\|failed` sin fallar el pipeline |
+| 6 | `promote-rollback` | Actúa sobre `outcome`: BlueGreen promote/abort; Canary promote faseado con k6 intermedio o abort; Rolling no-op/undo |
 
-El **prefijo del tag** decide el ambiente:
+### Convención de tag
 
-| Tag name | environment |
-|---|---|
-| `dev-vX.Y.Z` | develop |
-| `staging-vX.Y.Z` | staging |
-| `vX.Y.Z` (sin prefijo) | production |
-| `test-vX.Y.Z` | test |
+```
+refs/tags/<env>/<strategy>/<semver>
+```
+
+El interceptor CEL del EventListener filtra solo tags con exactamente esa forma
+(5 segmentos en el ref). Tags con formato distinto no disparan ningún pipeline.
+
+| Tag | environment | strategy | image_tag |
+|---|---|---|---|
+| `prod/bluegreen/v1.4.0` | prod | bluegreen | v1.4.0 |
+| `staging/canary/v1.4.0` | staging | canary | v1.4.0 |
+| `dev/rollingupdate/v1.4.0-rc1` | dev | rollingupdate | v1.4.0-rc1 |
+
+### Strategy por deploy, no por app
+
+Las apps no tienen una strategy fija. `bump-gitops` escribe `rollout.strategy`
+en el values del ambiente en cada run, reemplazando el valor anterior. Los
+Services e Ingresses `stable` y `preview` existen siempre (topología invariante),
+por lo que cambiar de BlueGreen a Canary entre deploys consecutivos no genera
+ninguna disrupción de red.
 
 ### Por qué nginx Ingress además del ALB Controller
 
@@ -299,7 +299,7 @@ BlueGreen alcanza con ALB nomás (es un switch atómico de target group).
 | ArgoRollouts | stateless | argo-rollouts Deployment | controla BlueGreen y Canary |
 | rbac-manager | stateless | rbac-manager Deployment | operator de RBACDefinition |
 | Grafana, Kibana, Headlamp | stateless | varios Deployment | |
-| Apps (api01, api02) | stateless | apps Rollout | NO Deployment, ArgoRollout |
+| Apps (api01, api02) | stateless | apps Rollout | NO Deployment, ArgoRollout — strategy según values del ambiente |
 | Tekton controller | cicd | tekton-pipelines Deployment | toleration workload=cicd |
 | Tekton EventListener | cicd | tekton-pipelines Deployment | webhook desde GitHub |
 | TestKube | cicd | testkube Deployment | lanza los tests k6 |

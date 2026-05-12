@@ -12,9 +12,10 @@ de cluster y la documentación.
 | Repo | Contenido |
 |------|-----------|
 | **tochallenge-belo** *(este)* | Terraform, addons, Makefile, docs |
-| [webserver-api01](https://github.com/Valentino-33/webserver-api01) | API en Python, estrategia Blue/Green, scripts k6 |
-| [webserver-api02](https://github.com/Valentino-33/webserver-api02) | API en Python, estrategia Canary, scripts k6 |
-| [gitops-files](https://github.com/Valentino-33/gitops-files) | Apps de ArgoCD por ambiente (test / develop / staging / production) |
+| [webserver-api01](https://github.com/Valentino-33/webserver-api01) | API en Python, scripts k6 (`src/loadtest/`) |
+| [webserver-api02](https://github.com/Valentino-33/webserver-api02) | API en Python, scripts k6 (`src/loadtest/`) |
+| [belo-helm-charts](https://github.com/Valentino-33/belo-helm-charts) | Chart `pythonapps` + tasks Tekton + values por app/ambiente |
+| [gitops-files](https://github.com/Valentino-33/gitops-files) | Applications de ArgoCD por ambiente |
 | [users-managment-aws](https://github.com/Valentino-33/users-managment-aws) | aws-auth, RBAC, IRSA, templates de usuarios y grupos, archivos OIDC |
 
 ## Documentación
@@ -76,3 +77,12 @@ levantar costo accidentalmente.
   ArgoRollouts usa nativamente para estrategia Canary.
 - **Imágenes:** Docker Hub. Si después se quiere mover a ECR, es cambiar
   registry en los pipelines y agregar IRSA para pull. Los Dockerfiles no cambian.
+- **Strategy por tag, no por app:** la misma app puede desplegarse con BlueGreen
+  a production, Canary a staging y RollingUpdate a dev. La strategy se codifica
+  en el tag Git (`<env>/<strategy>/<semver>`) y el pipeline la escribe en el
+  values file del ambiente antes de que ArgoCD sincronice. Ver `ROADMAP.md §7`
+  y `belo-helm-charts/README.md` para el detalle completo.
+- **Topología de red invariante:** los Services e Ingresses `stable` y `preview`
+  existen siempre para cada app, independientemente de la strategy activa. Esto
+  evita que cambiar de BlueGreen a RollingUpdate entre deploys destruya los
+  Services y genere downtime transitorio.

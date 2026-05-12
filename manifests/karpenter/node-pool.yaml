@@ -1,6 +1,6 @@
 # NodePool para nodos stateless escalables por Karpenter.
 # Apliar con: make addons-karpenter ENV=dev
-apiVersion: karpenter.sh/v1beta1
+apiVersion: karpenter.sh/v1
 kind: NodePool
 metadata:
   name: stateless
@@ -22,12 +22,12 @@ spec:
           operator: In
           values: ["amd64"]
       nodeClassRef:
-        apiVersion: karpenter.k8s.aws/v1beta1
+        group: karpenter.k8s.aws
         kind: EC2NodeClass
         name: default
   limits:
-    cpu: 16
-    memory: 64Gi
+    cpu: 32
+    memory: 128Gi
   disruption:
-    consolidationPolicy: WhenUnderutilized
-    consolidateAfter: 30s
+    consolidationPolicy: WhenEmptyOrUnderutilized
+    consolidateAfter: 5m

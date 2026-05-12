@@ -37,10 +37,10 @@ Nada de listas-de-bullets-de-marketing.
 |---|---|---|
 | [tochallenge-belo](https://github.com/Valentino-33/tochallenge-belo) | **Fase 1 mergeada + fixes locales del dueño** | Terraform: VPC, EKS, node groups, Karpenter IAM, ALB IRSA. Makefile, ROADMAP, COSTS, docs. **El dueño aplicó cambios locales** de versión de K8s y AMIs durante la ejecución exitosa — esos cambios son válidos y deben preservarse, no revertirse. |
 | [users-managment-aws](https://github.com/Valentino-33/users-managment-aws) | **Fase 2 entregada y commiteada** | IAM users/groups/roles, RBAC, aws-auth merge script, templates, OIDC preparado. Probado con éxito en cluster levantado. |
-| [webserver-api01](https://github.com/Valentino-33/webserver-api01) | Vacío | Próxima fase. API Python para Blue/Green |
-| [webserver-api02](https://github.com/Valentino-33/webserver-api02) | Vacío | Próxima fase. API Python para Canary |
-| [belo-helm-charts](https://github.com/Valentino-33/belo-helm-charts) | Vacío, sin diseñar todavía | **NUEVO repo agregado**. Chart maestro `pythonapps` reutilizable + `apps/<app>/app.yaml` build-time |
-| [gitops-files](https://github.com/Valentino-33/gitops-files) | Vacío | Apps de ArgoCD por ambiente + values runtime por ambiente |
+| [webserver-api01](https://github.com/Valentino-33/webserver-api01) | Vacío | Próxima fase. API Python — strategy por deploy, no fija |
+| [webserver-api02](https://github.com/Valentino-33/webserver-api02) | Vacío | Próxima fase. API Python — strategy por deploy, no fija |
+| [belo-helm-charts](https://github.com/Valentino-33/belo-helm-charts) | **Implementado** | Chart maestro `pythonapps` en `charts-core/`; pipeline-templates Tekton (6 stages); values por app y ambiente en `values-apps-files/` |
+| [gitops-files](https://github.com/Valentino-33/gitops-files) | Vacío | Solo Application CRs de ArgoCD por ambiente (no values — esos viven en belo-helm-charts) |
 
 ---
 
@@ -115,17 +115,24 @@ ROADMAP global.
   Los tres node groups usan `ami_type = "CUSTOM"` con launch template propio.
 
 ### CI/CD
-- **Pipelines:** Tekton + Triggers, disparados por **tag annotated** con
-  formato `deploy:<env>` y mensaje `strategy:<BlueGreen|Canary|RollingUpdate>`.
+- **Pipelines:** Tekton + Triggers, disparados por **tag** con formato
+  `<env>/<strategy>/<semver>` (ej: `prod/bluegreen/v1.4.0`). CEL
+  interceptor extrae los tres campos del ref; tags con otro formato son ignorados.
 - **Build:** Kaniko en pod (sin daemon Docker).
-- **Estrategias de deployment:** ArgoRollouts. BlueGreen para api01, Canary
-  para api02, RollingUpdate como default.
-- **GitOps:** ArgoCD apuntando a `gitops-files`, apps-of-apps pattern.
-- **Load testing:** k6 vía TestKube. Scripts en `loadtest/` del repo de cada
-  app. Integrados como stage del pipeline, distintos según strategy:
-  - BlueGreen: k6 contra el preview Service antes del switch
-  - Canary: k6 después de cada step de promoción (5% → 25% → 50% → 100%)
-  - RollingUpdate: smoke test al final
+- **Strategy por deploy, no por app:** `bump-gitops` escribe `rollout.strategy`
+  en el values del ambiente junto con `image.tag`. La misma app puede desplegarse
+  con BlueGreen en production, Canary en staging y RollingUpdate en dev.
+- **Topología de red invariante:** Services e Ingresses `stable` y `preview`
+  existen siempre. Cambiar de strategy entre deploys no destruye la red.
+- **GitOps:** ArgoCD apuntando a `belo-helm-charts` (no a `gitops-files` para
+  los values — belo-helm-charts centraliza chart + values).
+- **Pipeline (6 stages):**
+  1. clone → 2. build-push → 3. bump-gitops → 4. wait-argocd → 5. load-test → 6. promote-rollback
+- **Load testing:** k6 in-cluster (pod en nodo cicd). Scripts en `src/loadtest/`
+  del repo de cada app. Promoción/rollback automático basado en el result de k6:
+  - BlueGreen: k6 contra preview → promote o abort
+  - Canary: k6 faseado (5% → 25% → 50% → 100%), abort en cualquier fallo
+  - RollingUpdate: smoke → no-op o undo
 
 ### Observabilidad
 - **Logs:** EFK (Elasticsearch + Fluent-bit + Kibana). Elastic pinneado al
@@ -310,37 +317,39 @@ La arquitectura definitiva separa tres capas en dos repos.
 
 ```
 belo-helm-charts/
-└── pythonapps/                          ← chart maestro, replicable (javaapps, goapps…)
-    ├── Chart.yaml
-    ├── values.yaml                      ← defaults standalone
-    ├── templates/
-    │   ├── rollout.yaml                 ← ArgoRollout parametrizado por strategy
-    │   ├── service.yaml
-    │   ├── ingress.yaml
-    │   ├── servicemonitor.yaml
-    │   ├── hpa.yaml
-    │   └── pipeline-templates/          ← Tasks/Pipeline de Tekton del stack Python
-    │       ├── task-clone.yaml
-    │       ├── task-build-kaniko.yaml
-    │       ├── task-push-gitops.yaml
-    │       ├── task-load-test.yaml      ← warning si no hay k6, nunca falla
-    │       └── pipeline-pythonapps.yaml
-    └── apps/
-        ├── webserver-api01/
-        │   ├── build-time/
-        │   │   └── app.yaml             ← image_name, registry, repo_url, owner
-        │   ├── dev/
-        │   │   └── values-api01-dev.yaml
-        │   ├── testing/
-        │   │   └── values-api01-testing.yaml
-        │   ├── lab/
-        │   │   └── values-api01-lab.yaml
-        │   ├── staging/
-        │   │   └── values-api01-staging.yaml
-        │   └── production/
-        │       └── values-api01-production.yaml
-        └── webserver-api02/
-            └── (misma estructura)
+├── charts-core/
+│   └── pythonapps/                      ← chart maestro, replicable (javaapps, goapps…)
+│       ├── Chart.yaml
+│       ├── values.yaml                  ← defaults standalone
+│       └── templates/
+│           ├── rollout.yaml             ← ArgoRollout; strategy=bluegreen|canary|rollingupdate
+│           ├── service.yaml             ← siempre crea <app>-stable y <app>-preview (invariante)
+│           ├── ingress.yaml             ← siempre crea <app>-stable y <app>-preview (invariante)
+│           ├── servicemonitor.yaml
+│           ├── hpa.yaml
+│           └── pipeline-templates/      ← Tasks/Pipeline de Tekton del stack Python
+│               ├── tekton-sa.yaml
+│               ├── event-listener.yaml
+│               ├── trigger-binding.yaml
+│               ├── trigger-template.yaml
+│               ├── task-clone.yaml
+│               ├── task-build-kaniko.yaml
+│               ├── task-bump-gitops.yaml    ← yq: image.tag + rollout.strategy; git push
+│               ├── task-wait-argocd.yaml
+│               ├── task-load-test.yaml      ← warning si no hay k6; nunca falla el pipeline
+│               ├── task-promote-rollback.yaml
+│               └── pipeline-pythonapps.yaml ← Pipeline de 6 stages
+└── values-apps-files/
+    ├── webserver-api01/
+    │   ├── build-time/
+    │   │   └── app-values.yaml          ← image repo, pullPolicy, metricsPath, tekton params
+    │   ├── values-dev-webserver-api01.yaml
+    │   ├── values-testing-webserver-api01.yaml
+    │   ├── values-lab-webserver-api01.yaml
+    │   ├── values-staging-webserver-api01.yaml
+    │   └── values-prod-webserver-api01.yaml
+    └── webserver-api02/
+        └── (misma estructura)
 ```
 
 ### Repo `gitops-files` (estructura definitiva)
@@ -358,38 +367,43 @@ gitops-files/
 ```
 
 `gitops-files` solo contiene Application CRDs de ArgoCD. Los values de cada
-app y ambiente viven en `belo-helm-charts/pythonapps/apps/<app>/<env>/`.
+app y ambiente viven en `belo-helm-charts/values-apps-files/<app>/`.
 Separar por `gitops-core-$env` permite disaster recovery selectivo y RBAC
 granular en ArgoCD por ambiente.
 
 ### Composición final en el pipeline
 
 ```bash
-helm template api01 belo-helm-charts/pythonapps/ \
-  -f belo-helm-charts/pythonapps/apps/webserver-api01/build-time/app.yaml \
-  -f belo-helm-charts/pythonapps/apps/webserver-api01/dev/values-api01-dev.yaml \
-  --set image.tag=v1.4.0
+# Desde la raíz de belo-helm-charts/
+helm template webserver-api01 charts-core/pythonapps/ \
+  -f values-apps-files/webserver-api01/build-time/app-values.yaml \
+  -f values-apps-files/webserver-api01/values-dev-webserver-api01.yaml \
+  -n dev
 ```
 
 ### Por qué se separa build-time de runtime
 
-- **Build-time** (`build-time/app.yaml`): registry, image_name, repo_url, owner.
-  Cambia raramente. Vive con el chart, no con el ambiente.
-- **Runtime por ambiente** (`<env>/values-<app>-<env>.yaml`): réplicas, recursos,
-  strategy, HPA, hostname. Cambia seguido e independientemente por ambiente.
-- **`gitops-files`**: no tiene values — solo referencia Application CRs que
-  apuntan a los values en `belo-helm-charts`.
+- **Build-time** (`build-time/app-values.yaml`): registry, image_name, repo_url, owner.
+  Cambia raramente. Vive junto al values-apps-files de cada app.
+- **Runtime por ambiente** (`values-<env>-<app>.yaml`): réplicas, recursos,
+  `rollout.strategy`, HPA, hostname. `rollout.strategy` es sobreescrito por
+  `bump-gitops` en cada deploy — refleja la strategy del tag más reciente.
+- **`gitops-files`**: no tiene values — solo Application CRs que apuntan a
+  `charts-core/pythonapps` y a `../../values-apps-files/<app>/` en belo-helm-charts.
 
-### Decisiones confirmadas (10 de mayo 2026)
+### Decisiones confirmadas
 
 1. **Un solo chart `pythonapps`** parametrizado con `strategy: bluegreen|canary|rollingupdate`.
    No hay charts separados por strategy. ✅
-2. **`loadtest/` vive en el repo de cada app.** Si los archivos k6 no existen,
-   el stage de load-test del Pipeline genera un `WARN` en los logs y continúa
-   sin fallar. El PipelineRun nunca falla por ausencia de scripts de carga. ✅
-3. **Build-time en `belo-helm-charts/pythonapps/apps/<app>/build-time/app.yaml`.**
-   Runtime por ambiente en `belo-helm-charts/pythonapps/apps/<app>/<env>/values-<app>-<env>.yaml`.
-   Los values NO viven en `gitops-files` — ese repo solo contiene Application CRs de ArgoCD. ✅
+2. **`src/loadtest/` vive en el repo de cada app.** Si los scripts k6 no existen,
+   el stage de load-test emite `outcome=passed` con WARN y continúa sin fallar. ✅
+3. **Strategy por deploy, no por app.** El tag Git encoda la strategy; `bump-gitops`
+   la escribe en `values-<env>-<app>.yaml` junto con `image.tag`. ✅
+4. **Topología de red invariante.** Services e Ingresses `stable` y `preview`
+   siempre existen, independientemente de la strategy activa. ✅
+5. **`bump-gitops` commitea a `belo-helm-charts`** (no a `gitops-files`).
+   ArgoCD lee de `belo-helm-charts`. Los Application CRs en `gitops-files`
+   referencian `belo-helm-charts` como source. ✅
 
 ---
 

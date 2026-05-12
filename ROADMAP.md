@@ -189,12 +189,22 @@ sudo ln -s /mnt/statefull/prometheus    /var/lib/prometheus
 
 ```bash
 # Si algo salió mal, destruir y volver a empezar
-terraform destroy
+make tf-destroy ENV=dev
 ```
 
-> El destroy puede fallar si quedan ALB o ENI huérfanos creados por el ALB
-> Controller. Si pasa, ir a EC2 → Network Interfaces y borrarlas a mano. Es
-> un dolor conocido de EKS.
+> `make tf-destroy` corre automáticamente `make pre-destroy` antes de llamar
+> a Terraform. Este paso borra todos los Load Balancers (ALBs, NLBs, Classic)
+> y ENIs huérfanas que el ALB Controller o el VPC CNI hayan creado dentro de
+> la VPC, evitando el error `DependencyViolation` al intentar borrar subnets
+> e Internet Gateways.
+>
+> Si el destroy ya falló y el state de Terraform no puede leer el `vpc_id`,
+> usá el target standalone con el ID que aparece en el error:
+>
+> ```bash
+> make cleanup-vpc-deps VPC_ID=vpc-xxxxxxxxxxxxxxxxx
+> make tf-destroy ENV=dev
+> ```
 
 ---
 
@@ -222,17 +232,49 @@ kubectl get nodes   # tiene que mostrar los 3 nodos Ready
 
 ### Pasos
 
+> **Si ya destruiste el cluster antes** (ciclo demo/destroy): los ClusterRoleBindings y
+> RBACDefinitions del ciclo anterior pueden quedar residuales en el nuevo cluster. Correlos
+> en orden igual: primero limpiá, después instalá el operator, después IAM, después RBAC.
+
 ```bash
-# Clonar (o entrar si ya está clonado) al repo de auth
-cd ../users-managment-aws    # desde belochallenge/ si los repos son hermanos
+# Entrar al repo de auth (todos los siguientes `make` se corren desde ahí)
+cd ../users-managment-aws
 
-# 1. Crear usuarios IAM, grupos y roles en AWS
-make iam-apply
+# ── Paso 0 (solo si ya existió un ciclo anterior) ──────────────────────────
+# Eliminar ClusterRoleBindings viejos del modelo anterior (idempotente, no rompe si no existen)
+make rbac-migrate
 
-# 2. Actualizar el aws-auth ConfigMap (merge seguro, no pisa lo existente)
-make rbac-apply   # incluye el merge-aws-auth.sh y kubectl apply de los RBACDefinition
+# ── Paso 1 — Instalar el operador rbac-manager (una sola vez por cluster) ──
+# El operador tiene que estar corriendo ANTES de que se apliquen los RBACDefinitions.
+make rbac-manager-install
+# Verifica: kubectl get pods -n rbac-manager
 
-# 3. Verificar que los permisos están bien
+# ── Paso 2 — Crear recursos IAM en AWS ─────────────────────────────────────
+make iam-init    # inicializar backend (obligatorio la primera vez o después de tf-reinit)
+make iam-plan    # revisar qué se va a crear
+make iam-apply   # crear users IAM, groups y roles
+
+# ── Paso 3 — Guardar credenciales (se muestran UNA SOLA VEZ) ───────────────
+make get-credentials
+# → Copiar los access keys a un password manager ANTES de continuar.
+
+# ── Paso 4 — Configurar perfiles AWS CLI ───────────────────────────────────
+aws configure --profile dev-user-01
+# Access Key ID:     <el de dev-user-01 del paso anterior>
+# Secret Access Key: <ídem>
+# Default region:    us-east-1
+# Output format:     json
+
+aws configure --profile infra-user-01
+# (ídem con las keys de infra-user-01)
+
+# ── Paso 5 — Aplicar RBAC completo ─────────────────────────────────────────
+# Incluye: merge de aws-auth, ClusterRoles, ClusterRoleBindings e RBACDefinitions.
+make rbac-apply
+
+# ── Paso 6 — Verificar ─────────────────────────────────────────────────────
+# Si tu account ID no es 650790810564, pasalo como override:
+#   make verify-developer ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
 make verify-developer   # debe listar pods pero fallar al pedir secrets
 make verify-infra       # debe tener acceso completo
 ```
@@ -437,47 +479,53 @@ El código vive en [belo-helm-charts](https://github.com/Valentino-33/belo-helm-
 
 ```
 belo-helm-charts/
-└── pythonapps/                          ← chart maestro, replicable (javaapps, goapps…)
-    ├── Chart.yaml
-    ├── values.yaml                      ← defaults para que el chart funcione standalone
-    ├── templates/
-    │   ├── rollout.yaml                 ← ArgoRollout parametrizado por strategy
-    │   ├── service.yaml
-    │   ├── ingress.yaml
-    │   ├── servicemonitor.yaml
-    │   ├── hpa.yaml
-    │   └── pipeline-templates/          ← Tasks y Pipeline de Tekton para el stack Python
-    │       ├── task-clone.yaml
-    │       ├── task-build-kaniko.yaml
-    │       ├── task-push-gitops.yaml
-    │       ├── task-load-test.yaml      ← verifica si existen scripts k6; warning si no, nunca falla
-    │       └── pipeline-pythonapps.yaml
-    └── apps/
-        ├── webserver-api01/
-        │   ├── build-time/
-        │   │   └── app.yaml             ← image_name, registry, repo_url, owner
-        │   ├── dev/
-        │   │   └── values-api01-dev.yaml
-        │   ├── testing/
-        │   │   └── values-api01-testing.yaml
-        │   ├── lab/
-        │   │   └── values-api01-lab.yaml
-        │   ├── staging/
-        │   │   └── values-api01-staging.yaml
-        │   └── production/
-        │       └── values-api01-production.yaml
-        └── webserver-api02/
-            └── (misma estructura)
+├── charts-core/
+│   └── pythonapps/                      ← chart maestro, replicable (javaapps, goapps…)
+│       ├── Chart.yaml
+│       ├── values.yaml                  ← defaults para que el chart funcione standalone
+│       └── templates/
+│           ├── rollout.yaml             ← ArgoRollout; strategy=bluegreen|canary|rollingupdate
+│           ├── service.yaml             ← siempre crea <app>-stable y <app>-preview (invariante)
+│           ├── ingress.yaml             ← siempre crea <app>-stable y <app>-preview (invariante)
+│           ├── servicemonitor.yaml
+│           ├── hpa.yaml
+│           └── pipeline-templates/      ← Tasks y Pipeline de Tekton para el stack Python
+│               ├── tekton-sa.yaml       ← SA + RBAC (Triggers + Rollouts + ArgoCD reader)
+│               ├── event-listener.yaml  ← EventListener + Ingress para webhook de GitHub
+│               ├── trigger-binding.yaml ← extrae repo-url, app-name, env, strategy, tag del payload
+│               ├── trigger-template.yaml ← crea PipelineRun con params y PVCs efímeros
+│               ├── task-clone.yaml
+│               ├── task-build-kaniko.yaml
+│               ├── task-bump-gitops.yaml    ← yq: image.tag + rollout.strategy en values; git push
+│               ├── task-wait-argocd.yaml    ← polling ArgoCD Synced+Healthy + Rollout Paused|Healthy
+│               ├── task-load-test.yaml      ← k6; emite result outcome=passed|failed; nunca falla
+│               ├── task-promote-rollback.yaml ← actúa sobre outcome; Canary 3 fases con k6 intermedio
+│               └── pipeline-pythonapps.yaml   ← Pipeline de 6 stages
+└── values-apps-files/
+    ├── webserver-api01/
+    │   ├── build-time/
+    │   │   └── app-values.yaml          ← image repo, pullPolicy, metricsPath, tekton params
+    │   │                                  (rollout.strategy NO está acá — viene del tag Git)
+    │   ├── values-dev-webserver-api01.yaml
+    │   ├── values-testing-webserver-api01.yaml
+    │   ├── values-lab-webserver-api01.yaml
+    │   ├── values-staging-webserver-api01.yaml
+    │   └── values-prod-webserver-api01.yaml
+    └── webserver-api02/
+        └── (misma estructura)
 ```
 
 ### build-time vs. runtime — por qué separados
 
-- **build-time** (`build-time/app.yaml`): registry, nombre de imagen, repo_url y
+- **build-time** (`build-time/app-values.yaml`): registry, nombre de imagen, repo_url y
   owner. Cambia raramente — solo cuando se migra el registry o se hace un fork.
-  Es metadata de la app, no del ambiente.
-- **runtime por ambiente** (`<env>/values-<app>-<env>.yaml`): réplicas, recursos,
-  strategy de deployment, hostname de Ingress, límites del HPA. Cambia seguido
-  y de forma independiente por ambiente.
+  Es metadata de la app, no del ambiente. **`rollout.strategy` no va acá** —
+  la strategy se determina en el tag Git y `bump-gitops` la escribe en el values
+  del ambiente en cada deploy.
+- **runtime por ambiente** (`values-<env>-<app>.yaml`): réplicas, recursos,
+  `rollout.strategy`, hostname de Ingress, límites del HPA. `rollout.strategy`
+  acá es el último valor escrito por el pipeline — refleja la strategy del deploy
+  más reciente en ese ambiente.
 
 Los **pipeline-templates/** viven en `pythonapps/` porque son específicos del
 stack tecnológico. Una app Java usaría `javaapps/pipeline-templates/` con un
@@ -486,10 +534,11 @@ task de Maven en lugar de pip. Los templates no son intercambiables entre stacks
 ### Composición en el pipeline
 
 ```bash
-helm template api01 belo-helm-charts/pythonapps/ \
-  -f belo-helm-charts/pythonapps/apps/webserver-api01/build-time/app.yaml \
-  -f belo-helm-charts/pythonapps/apps/webserver-api01/dev/values-api01-dev.yaml \
-  --set image.tag=v1.4.0
+# Desde la raíz de belo-helm-charts/
+helm template webserver-api01 charts-core/pythonapps/ \
+  -f values-apps-files/webserver-api01/build-time/app-values.yaml \
+  -f values-apps-files/webserver-api01/values-dev-webserver-api01.yaml \
+  -n dev
 ```
 
 ### Verificación (dry-run antes de aplicar)
@@ -498,14 +547,14 @@ helm template api01 belo-helm-charts/pythonapps/ \
 git clone https://github.com/Valentino-33/belo-helm-charts
 cd belo-helm-charts
 
-helm lint pythonapps/ \
-  -f pythonapps/apps/webserver-api01/build-time/app.yaml \
-  -f pythonapps/apps/webserver-api01/dev/values-api01-dev.yaml
+helm lint charts-core/pythonapps/ \
+  -f values-apps-files/webserver-api01/build-time/app-values.yaml \
+  -f values-apps-files/webserver-api01/values-dev-webserver-api01.yaml
 
-helm template api01 pythonapps/ \
-  -f pythonapps/apps/webserver-api01/build-time/app.yaml \
-  -f pythonapps/apps/webserver-api01/dev/values-api01-dev.yaml \
-  --set image.tag=v0.1.0 | kubectl apply --dry-run=client -f -
+helm template webserver-api01 charts-core/pythonapps/ \
+  -f values-apps-files/webserver-api01/build-time/app-values.yaml \
+  -f values-apps-files/webserver-api01/values-dev-webserver-api01.yaml \
+  -n dev | kubectl apply --dry-run=client -f -
 ```
 
 ---
@@ -528,23 +577,23 @@ Repos: [webserver-api01](https://github.com/Valentino-33/webserver-api01) y
 webserver-apiNN/
 ├── Dockerfile
 ├── pyproject.toml          ← FastAPI + uvicorn + structlog + prometheus_client
-├── app/
-│   ├── main.py             ← endpoints /, /health, /version, /metrics
-│   ├── logging_config.py   ← 5 niveles: trace, debug, info, warn, error
-│   └── ...
-├── loadtest/               ← scripts k6 opcionales; si no existen el pipeline sigue con warning
-│   ├── smoke.js
-│   ├── load-bluegreen.js   ← solo en api01 (BlueGreen pre-switch)
-│   ├── load-canary.js      ← solo en api02 (después de cada step de promoción)
-│   └── README.md
-└── .tekton/
-    └── pipelinerun.yaml    ← template del PipelineRun que dispara Tekton
+└── src/
+    ├── app/
+    │   ├── main.py             ← endpoints /, /health, /version, /metrics
+    │   ├── logging_config.py   ← 5 niveles: trace, debug, info, warn, error
+    │   └── ...
+    └── loadtest/               ← scripts k6 opcionales; si no existen el pipeline sigue con warning
+        ├── smoke.js            ← usado en RollingUpdate (smoke post-deploy contra stable svc)
+        ├── load-bluegreen.js   ← usado en BlueGreen (k6 contra preview svc antes del switch)
+        ├── load-canary.js      ← usado en Canary (k6 contra preview svc en cada fase)
+        └── README.md
 ```
 
-> La presencia de `loadtest/` es opcional — el stage de load-test del Pipeline
-> verifica si los archivos k6 existen antes de correrlos. Si no están, escribe
-> un warning en el log del PipelineRun y continúa sin fallar. Esto permite que
-> el pipeline funcione desde el primer commit sin tener tests de carga listos.
+> Los scripts k6 son opcionales — si no existen, el pipeline emite `outcome=passed`
+> con un WARN y continúa. Esto permite que el pipeline funcione desde el primer
+> commit sin tests de carga listos. Ningún script es exclusivo de una app: cualquier
+> app puede desplegarse con cualquier strategy según el tag, y el pipeline elige
+> el script correspondiente.
 
 ### Build local de la imagen (smoke test)
 
@@ -624,14 +673,14 @@ spec:
   source:
     repoURL: https://github.com/Valentino-33/belo-helm-charts
     targetRevision: main
-    path: pythonapps
+    path: charts-core/pythonapps
     helm:
       valueFiles:
-        - apps/webserver-api01/build-time/app.yaml
-        - apps/webserver-api01/dev/values-api01-dev.yaml
+        - ../../values-apps-files/webserver-api01/build-time/app-values.yaml
+        - ../../values-apps-files/webserver-api01/values-dev-webserver-api01.yaml
   destination:
     server: https://kubernetes.default.svc
-    namespace: apps-dev
+    namespace: dev
   syncPolicy:
     automated:
       prune: true
@@ -639,7 +688,7 @@ spec:
 ```
 
 ArgoCD sincroniza directamente contra `belo-helm-charts`. El pipeline de Tekton
-solo necesita commitear el nuevo tag de imagen en el values del ambiente
+solo necesita commitear el nuevo tag de imagen y la strategy en el values del ambiente
 después de pushear la imagen a Docker Hub.
 
 ### Bootstrap en el cluster
@@ -653,71 +702,88 @@ kubectl -n argocd get applications
 ```
 
 A partir de acá, **todo cambio de imagen, réplicas o config va por commit a
-`belo-helm-charts/pythonapps/apps/<app>/<env>/`**, no por kubectl.
+`belo-helm-charts/values-apps-files/<app>/values-<env>-<app>.yaml`**, no por kubectl.
 
 ---
 
 ## Fase 7 — CI/CD con Tekton
 
-> **Manifests de pipeline:** `belo-helm-charts/pythonapps/templates/pipeline-templates/`
-> **Template de PipelineRun:** `.tekton/pipelinerun.yaml` en cada repo de app
+> **Manifests de pipeline:** `belo-helm-charts/charts-core/pythonapps/templates/pipeline-templates/`
 > **Comandos de operación:** `tkn` CLI con kubeconfig del cluster activo
-> **Disparo:** `git tag -a deploy:<env> -m "strategy:<BlueGreen|Canary|RollingUpdate>" <version>`
+> **Disparo:** `git tag <env>/<strategy>/<semver>` — ver "Cómo se dispara" abajo
 
-Salida: EventListener escuchando webhooks de GitHub, Pipeline que cubre
-Blue/Green, Canary y RollingUpdate según el `tag annotated`, y los stages
-de k6 integrados.
+Salida: EventListener escuchando webhooks de GitHub, Pipeline de 6 stages que
+cubre BlueGreen, Canary y RollingUpdate con promoción/rollback automático basado
+en los resultados de k6.
 
 > **Nodo dedicado:** todos los PipelineRuns corren en el nodo con label
-> `role=cicd` mediante toleration `workload=cicd:NoSchedule`. Los
-> manifests en `pipeline-templates/` ya incluyen ese toleration — no hay
-> que setearlo a mano. El nodo cicd es un t3.medium separado de los workers
-> de aplicación, así un build pesado no impacta en la latencia de las apps.
+> `role=cicd` mediante toleration `workload=cicd:NoSchedule`. El nodo cicd es
+> un t3.medium separado de los workers de aplicación, así un build pesado no
+> impacta en la latencia de las apps.
 
-> **Load tests opcionales:** el stage `load-test` verifica si los scripts
-> k6 existen en `loadtest/` del repo de la app antes de correrlos. Si no
-> están, loguea `WARN: no k6 scripts found, skipping load test stage` y
-> continúa. El PipelineRun nunca falla por ausencia de scripts de carga.
+> **Load tests opcionales:** si los scripts k6 no existen en `src/loadtest/`
+> del repo de la app, el stage load-test emite `outcome=passed` con un WARN
+> y el pipeline continúa. El PipelineRun nunca falla por ausencia de scripts.
+
+> **Strategy por deploy, no por app:** la strategy se codifica en el tag Git y
+> `bump-gitops` la escribe en el values file del ambiente en cada run. El chart
+> la toma desde ahí. Cambiar de bluegreen a canary entre deploys consecutivos
+> en el mismo ambiente es válido — la topología de red (stable+preview) no
+> cambia, solo el comportamiento del Rollout.
 
 ### El Pipeline en alto nivel
 
 ```
-git tag (annotated) "deploy:<ambiente> strategy:<estrategia>"
+git tag <env>/<strategy>/<semver>
         │
         ▼
-GitHub webhook → Tekton EventListener
+GitHub webhook → Tekton EventListener (CEL: filtra refs/tags/<x>/<y>/<z>)
+        │         extrae environment, strategy, image_tag
+        ▼
+TriggerTemplate → PipelineRun en nodo cicd (taint workload=cicd)
+  workspaces: source (2Gi gp3) + gitops (1Gi gp3) — PVCs efímeros
         │
         ▼
-PipelineRun con PVC efímero de 1GB
-        │
-        ▼
-┌─────────────────────────────────────┐
-│ Stage 1: clone-repo                 │
-├─────────────────────────────────────┤
-│ Stage 2: build-image (Kaniko)       │
-├─────────────────────────────────────┤
-│ Stage 3: push-to-dockerhub          │
-├─────────────────────────────────────┤
-│ Stage 4: bump-helm-values           │
-│   (commit al gitops-files)          │
-├─────────────────────────────────────┤
-│ Stage 5: wait-for-argocd-sync       │
-├─────────────────────────────────────┤
-│ Stage 6: load-test (TestKube + k6)  │
-│   ┌───────────────────────────┐     │
-│   │ Si BlueGreen:             │     │
-│   │   k6 contra el preview    │     │
-│   │   svc                     │     │
-│   │ Si Canary:                │     │
-│   │   k6 después del 5%       │     │
-│   │   y después del 25%       │     │
-│   │ Si RollingUpdate:         │     │
-│   │   k6 smoke al final       │     │
-│   └───────────────────────────┘     │
-├─────────────────────────────────────┤
-│ Stage 7: promote-or-rollback        │
-│   (kubectl argo rollouts ...)       │
-└─────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│ Stage 1: clone                                              │
+│   git clone --depth 1 del repo de la app                   │
+├─────────────────────────────────────────────────────────────┤
+│ Stage 2: build-push                                         │
+│   Kaniko: build desde src/Dockerfile + push a Docker Hub   │
+│   (cache=true, ttl=24h)                                     │
+├─────────────────────────────────────────────────────────────┤
+│ Stage 3: bump-gitops                                        │
+│   yq: image.tag + rollout.strategy en values-<env>-<app>   │
+│   git commit + push → dispara sync de ArgoCD               │
+├─────────────────────────────────────────────────────────────┤
+│ Stage 4: wait-argocd                                        │
+│   polling hasta ArgoCD Application: Synced + Healthy        │
+│   polling hasta Rollout fase esperada:                      │
+│     BlueGreen/Canary → Paused  (nueva versión lista)        │
+│     RollingUpdate    → Healthy (deploy completo)            │
+├─────────────────────────────────────────────────────────────┤
+│ Stage 5: load-test (k6)                                     │
+│   BlueGreen → k6 contra preview svc (green aislado)        │
+│   Canary    → k6 contra preview svc (5% canary pods)       │
+│   Rolling   → k6 smoke contra stable svc                   │
+│   Emite result outcome=passed|failed — no falla el pipeline │
+├─────────────────────────────────────────────────────────────┤
+│ Stage 6: promote-rollback (automático según outcome)        │
+│                                                             │
+│   BlueGreen:                                                │
+│     passed → argo promote (switch green→stable)            │
+│     failed → argo abort   (destruye green, stable intacto) │
+│                                                             │
+│   Canary (faseado):                                         │
+│     passed@5% → promote (25%) → k6 →                       │
+│     passed@25% → promote (50%) → k6 →                      │
+│     passed@50% → promote --full (100%)                      │
+│     failed en cualquier fase → argo abort                   │
+│                                                             │
+│   RollingUpdate:                                            │
+│     passed → no-op (deploy ya completo)                     │
+│     failed → argo undo (revierte al ReplicaSet anterior)   │
+└─────────────────────────────────────────────────────────────┘
 ```
 
 ### Cómo se dispara
@@ -725,38 +791,78 @@ PipelineRun con PVC efímero de 1GB
 El developer hace:
 
 ```bash
-git tag -a deploy:production -m "strategy:BlueGreen" v1.4.0
-git push origin v1.4.0
+# BlueGreen a prod
+git tag prod/bluegreen/v1.4.0
+git push origin prod/bluegreen/v1.4.0
+
+# Canary a staging
+git tag staging/canary/v1.4.0
+git push origin staging/canary/v1.4.0
+
+# RollingUpdate a dev
+git tag dev/rollingupdate/v1.4.0-rc1
+git push origin dev/rollingupdate/v1.4.0-rc1
 ```
 
-El interceptor lee la annotation y setea las variables del Pipeline. Si solo
-escribe `git tag v1.4.0` sin annotation, default = RollingUpdate.
+El CEL interceptor del EventListener filtra solo tags con exactamente 5 segmentos
+en el ref (`refs/tags/<env>/<strategy>/<semver>`). Tags con otro formato son ignorados
+sin disparar ningún pipeline.
 
-Ver `manifests/tekton/` para los archivos completos. Los Pipelines son CRDs
-reutilizables — la misma definición sirve para api01 y api02 cambiando solo
-los params.
+Los Pipelines son CRDs reutilizables — la misma definición sirve para api01 y
+api02 cambiando solo los params que llegan desde el TriggerTemplate.
 
-### Ramas según strategy (lógica del Pipeline)
+### Topología de red (invariante)
 
-| Strategy | Qué pasa |
-|---|---|
-| **BlueGreen** + production | Deploy de "green", k6 sobre green aislado, si pasa → switch traffic, si no → destruir green |
-| **Canary** + production    | Deploy con 5% → k6 → 25% → k6 → 50% → k6 → 100%. Cualquier fallo dispara rollback automático |
-| **RollingUpdate** (o tag sin strategy) | Default. Reemplazo progresivo, k6 smoke al final |
+Services e Ingresses `stable` y `preview` existen siempre, independientemente de
+la strategy activa. Esto evita que cambiar de BlueGreen a RollingUpdate entre
+deploys destruya los Services y genere downtime. ArgoRollouts manipula los
+selectors de ambos services según la strategy del Rollout.
+
+### Ramas según strategy
+
+| Strategy | k6 apunta a | promote-rollback |
+|---|---|---|
+| **BlueGreen** | `preview` svc (green aislado) | promote o abort según outcome |
+| **Canary** | `preview` svc (canary pods), tres fases | promote faseado o abort en cualquier fase |
+| **RollingUpdate** | `stable` svc (smoke post-deploy) | no-op o undo según outcome |
+
+### Secretos necesarios
+
+```bash
+# Docker Hub — build y push de imágenes
+kubectl create secret generic dockerhub-credentials \
+  --from-file=.dockerconfigjson=$HOME/.docker/config.json \
+  -n tekton-pipelines
+
+# GitHub PAT — push a gitops-files (bump-gitops)
+kubectl create secret generic gitops-github-token \
+  --from-literal=token=<github-pat> \
+  -n tekton-pipelines
+```
 
 ### Verificación
 
 ```bash
-# Que el EventListener esté escuchando
-kubectl -n tekton get el
+# EventListener escuchando
+kubectl -n tekton-pipelines get el
 
-# Disparar manualmente un PipelineRun (sin webhook) para testear
-tkn pipeline start app-deploy-pipeline \
-  -p git-url=https://github.com/Valentino-33/webserver-api01 \
-  -p git-revision=main \
-  -p strategy=Canary \
-  -p environment=develop \
-  -w name=workspace,emptyDir="size=1Gi"
+# Disparar manualmente un PipelineRun (sin webhook)
+tkn pipeline start pythonapps-pipeline \
+  -p repo-url=https://github.com/Valentino-33/webserver-api01 \
+  -p app-name=webserver-api01 \
+  -p image-tag=v1.4.0 \
+  -p image-full=docker.io/valentinobruno/webserver-api01:v1.4.0 \
+  -p environment=dev \
+  -p strategy=rollingupdate \
+  -p gitops-repo-url=https://github.com/Valentino-33/belo-helm-charts \
+  -p preview-url=http://webserver-api01-preview.dev.svc.cluster.local:8000 \
+  -p base-url=http://webserver-api01-stable.dev.svc.cluster.local:8000 \
+  -w name=source,emptyDir="" \
+  -w name=gitops,emptyDir="" \
+  -n tekton-pipelines
+
+# Ver logs de un run en curso
+tkn pipelinerun logs -f -n tekton-pipelines
 ```
 
 ---

@@ -1,0 +1,36 @@
+Descripción general
+
+Este desafío técnico se enfoca en demostrar tu capacidad para implementar estrategias modernas de despliegue en Kubernetes. Vas a crear una demostración práctica de despliegues Blue/Green y Canary en un entorno local de Kubernetes.
+
+🎯 Objetivos del desafío
+
+Crear un repositorio de GitHub que demuestre:
+
+Implementación de despliegues Blue/Green
+Estrategia de despliegue Canary
+Documentación e instrucciones claras
+🛠️ Requisitos técnicos
+Implementaciones requeridas
+Servicios web
+Servidores web simples con identificación de versión
+Registro de solicitudes (request logging) en stdout
+Diferentes respuestas para cada versión desplegada
+Configuración de Kubernetes
+Clúster local usando cualquier herramienta (minikube, microk8s, etc.)
+Herramienta de pruebas de carga
+Implementar scripts de k6 (o cualquier herramienta de load testing) para simular tráfico
+📦 Entregables
+Contenido del repositorio de GitHub
+Documentación
+Instrucciones de configuración en README.md
+Guía paso a paso de despliegue
+Código
+Dockerfiles de los servicios
+Manifiestos de Kubernetes
+Scripts de pruebas de carga
+📊 Enfoque de evaluación
+Calidad y organización del código
+Facilidad para desplegar/ejecutar los escenarios
+Correctitud de la implementación
+Claridad de la documentación
+Enfoque de testing
